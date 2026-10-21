@@ -2,7 +2,7 @@
 
 An unofficial homebrew wrapper for the Android ARMv7 version of Jet Set Radio on Nintendo Switch, powered by **android32**. It runs the game's ARM code natively: this is not an Android emulator or a rewrite of the game.
 
-**Release: 1.0.0.** No APK, OBB, game libraries or commercial game assets are included. You must supply the files from your own legitimate copy. This project is not affiliated with SEGA or Nintendo.
+ No APK, OBB, game libraries or commercial game assets are included. You must supply the files from your own legitimate copy. This project is not affiliated with SEGA or Nintendo.
 
 ## Performance and 60 FPS
 
