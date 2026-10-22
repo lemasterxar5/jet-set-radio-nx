@@ -1,0 +1,1743 @@
+--- a/runtime/source/rt_audout.c
++++ b/runtime/source/rt_audout.c
+@@ -97,8 +97,11 @@
+   for (int i = 0; i < NBUF; i++) {
+     if (!g_pcm[i])
+       g_pcm[i] = memalign(0x1000, BUF_BYTES);
+-    if (!g_pcm[i])
++    if (!g_pcm[i]) {
++      audoutStopAudioOut();
++      audoutExit();
+       return -1;
++    }
+     memset(g_pcm[i], 0, BUF_BYTES);
+     g_bufs[i].buffer = (u64)(uintptr_t)g_pcm[i];
+     g_bufs[i].buffer_size = BUF_BYTES;
+--- a/source/jsr.h
++++ b/source/jsr.h
+@@ -51,11 +51,13 @@
+ void jsr_audio_bind(so_module *module);
+ void jsr_audio_stop(void);
+ void jsr_audio_pause(int paused);
++void jsr_audio_catchup(int active);
+ 
+ /* ------------------------------------------------------------ jsr_input.c */
+ /* Called once per frame, before step(): the touch screen as the touches the
+  * engine asked for, and the buttons as their layout points. */
+ void jsr_input_init(void);
++int jsr_input_install(so_module *module);
+ void jsr_input_poll(void);
+ int jsr_input_pad_connected(void);
+ /* One press at a point, as its own batch (the frame loop's KEY_PLUS). */
+--- a/source/jsr_audio.c
++++ b/source/jsr_audio.c
+@@ -19,6 +19,7 @@
+ static uint32_t g_phase, g_rate;
+ static int g_seeded, g_pump;
+ static volatile int g_running, g_paused;
++static volatile int g_catchup;
+ static unsigned long g_blocks, g_invalid, g_active_mask;
+ static int g_peak, g_reported_sound;
+ static Mutex g_lock;
+@@ -74,7 +75,7 @@
+ static void pump(int16_t *out, int frames, void *ud) {
+   (void)ud;
+   memset(out, 0, (size_t)frames * 2 * sizeof *out);
+-  if (!g_running || g_paused || !g_array || !g_nat.audioFillStreamBuffer)
++  if (!g_running || g_paused || g_catchup || !g_array || !g_nat.audioFillStreamBuffer)
+     return;
+   if (!g_seeded) {
+     source_frame(g_previous);
+@@ -140,6 +141,7 @@
+   g_blocks = g_invalid = g_active_mask = 0;
+   g_peak = g_reported_sound = 0;
+   g_paused = 0;
++  g_catchup = 0;
+   mutexInit(&g_lock);
+   rt_audout_cancel(0);
+   rt_audout_pause(0);
+@@ -159,7 +161,12 @@
+ 
+ void jsr_audio_pause(int paused) {
+   g_paused = paused;
+-  rt_audout_pause(paused);
++  rt_audout_pause(g_paused || g_catchup);
++}
++
++void jsr_audio_catchup(int active) {
++  g_catchup = active;
++  rt_audout_pause(g_paused || g_catchup);
+ }
+ 
+ void jsr_audio_stop(void) {
+--- a/source/jsr_collision60.c
++++ b/source/jsr_collision60.c
+@@ -18,36 +18,128 @@
+   CollisionQuery *queries;
+   unsigned count, capacity;
+   int valid;
++  uint32_t identity[4];
++  uint64_t last_used;
+ } CollisionActor;
+ 
+ uintptr_t jsr_coli60_ride_tail, jsr_coli60_move_tail, jsr_coli60_object_tail;
++uintptr_t jsr_coli60_graffiti_pos_tail, jsr_coli60_graffiti_ignore_tail, jsr_coli60_graffiti_range_tail;
++uintptr_t jsr_coli60_graffiti_enemy_range_tail;
++uintptr_t jsr_coli60_follow_tail;
+ uint32_t jsr_coli60_object_literal;
+ extern void jsr_coli60_original_ride(void *, const float *, const float *, void *, uint32_t, uint32_t);
+ extern void jsr_coli60_original_move(void *, const float *, const float *, const float *, float, void *, uint32_t, uint32_t);
+ extern void jsr_coli60_original_object(void *, void *, float, void *, uint32_t, void *);
++extern void jsr_coli60_original_graffiti_pos(const float *, void *);
++extern void jsr_coli60_original_graffiti_ignore(const float *, void *);
++extern void jsr_coli60_original_graffiti_range(void *, void *);
++extern void jsr_coli60_original_graffiti_enemy_range(const float *, void *, void *);
++extern void jsr_coli60_original_follow(void *, void *);
+ static CollisionActor *g_actors, *g_capture;
+ static float **g_matrix;
+ static int g_installed;
++static uint64_t g_generation;
++static unsigned g_actor_count;
++static size_t g_query_bytes;
++static const uint32_t *g_result_pool;
++static uintptr_t g_camera_callback;
++static unsigned long g_expired_results;
++
++static void actor_identity(void *player, uint32_t identity[4]) {
++  static const unsigned player_offsets[] = {0x04, 0x404, 0x418, 0x4e0};
++  static const unsigned camera_offsets[] = {0x04, 0x238, 0x240, 0x248};
++  uint32_t callback;
++  memcpy(&callback, (uint8_t *)player + 0x08, sizeof callback);
++  const unsigned *offsets = g_camera_callback && callback == g_camera_callback ? camera_offsets : player_offsets;
++  for (unsigned index = 0; index < 4; index++)
++    memcpy(&identity[index], (uint8_t *)player + offsets[index], sizeof identity[index]);
++}
++
++static int current_result(uint32_t node) {
++  unsigned last = g_result_pool[1];
++  if (last >= 50)
++    return 0;
++  for (unsigned index = 0; index <= last; index++) {
++    uint32_t block = g_result_pool[2 + index];
++    unsigned used = index < last ? 50 : g_result_pool[0xd0 / 4];
++    if (used > 50)
++      return 0;
++    if (block && node >= block && node - block < used * 20 && !((node - block) % 20))
++      return 1;
++  }
++  return 0;
++}
++
++void jsr_collision60_prepare(void *player) {
++  static const unsigned player_heads[] = {0x408, 0x41c, 0x424, 0x544};
++  static const unsigned camera_heads[] = {0x23c, 0x244, 0x24c};
++  if (!g_installed || !g_result_pool || !player)
++    return;
++  uint32_t callback;
++  memcpy(&callback, (uint8_t *)player + 0x08, sizeof callback);
++  int camera = g_camera_callback && callback == g_camera_callback;
++  const unsigned *heads = camera ? camera_heads : player_heads;
++  unsigned count_heads = camera ? 3 : 4;
++  for (unsigned index = 0; index < count_heads; index++) {
++    uint32_t head;
++    memcpy(&head, (uint8_t *)player + heads[index], sizeof head);
++    uint32_t node = head;
++    unsigned count = 0;
++    while (node && count++ < 2500 && current_result(node))
++      memcpy(&node, (const uint8_t *)(uintptr_t)node + 16, sizeof node);
++    if (node) {
++      uint32_t empty = 0;
++      memcpy((uint8_t *)player + heads[index], &empty, sizeof empty);
++      if (g_expired_results++ < 16)
++        debugPrintf("[native60] expired ride results discarded: player=%p slot=0x%x head=0x%lx invalid=0x%lx\n",
++                    player, heads[index], (unsigned long)head, (unsigned long)node);
++    }
++  }
++}
++
++static void release_actor(CollisionActor *entry) {
++  g_query_bytes -= entry->capacity * sizeof *entry->queries;
++  free(entry->queries);
++  free(entry);
++  g_actor_count--;
++}
++
++void jsr_collision60_tick(void) {
++  g_generation++;
++  for (CollisionActor **link = &g_actors; *link;) {
++    CollisionActor *entry = *link;
++    if (entry != g_capture && entry->last_used + 2 < g_generation) {
++      *link = entry->next;
++      release_actor(entry);
++    } else {
++      link = &entry->next;
++    }
++  }
++}
+ 
+ void jsr_collision60_reset(void) {
+   while (g_actors) {
+     CollisionActor *entry = g_actors;
+     g_actors = entry->next;
+-    free(entry->queries);
+-    free(entry);
++    release_actor(entry);
+   }
+   g_capture = NULL;
++  g_generation = 0;
+ }
+ 
+ static CollisionActor *find_actor(void *player, int create) {
+   for (CollisionActor *entry = g_actors; entry; entry = entry->next)
+-    if (entry->player == player)
++    if (entry->player == player) {
++      entry->last_used = g_generation;
+       return entry;
+-  if (!create)
++    }
++  if (!create || g_actor_count >= 128)
+     return NULL;
+   CollisionActor *entry = calloc(1, sizeof *entry);
+   if (entry) {
+     entry->player = player;
++    entry->last_used = g_generation;
++    g_actor_count++;
+     entry->next = g_actors;
+     g_actors = entry;
+   }
+@@ -59,15 +151,25 @@
+   if (g_capture) {
+     g_capture->count = 0;
+     g_capture->valid = 1;
++    actor_identity(player, g_capture->identity);
+   }
+ }
+ 
+ void jsr_collision60_end(void) { g_capture = NULL; }
+ 
+ void jsr_collision60_forget(void *player) {
+-  CollisionActor *entry = find_actor(player, 0);
+-  if (entry)
+-    entry->valid = 0;
++  for (CollisionActor **link = &g_actors; *link; link = &(*link)->next) {
++    CollisionActor *entry = *link;
++    if (entry->player == player) {
++      if (entry == g_capture) {
++        entry->valid = 0;
++      } else {
++        *link = entry->next;
++        release_actor(entry);
++      }
++      return;
++    }
++  }
+ }
+ 
+ static void record(CollisionQuery query) {
+@@ -75,7 +177,8 @@
+     return;
+   if (g_capture->count == g_capture->capacity) {
+     unsigned capacity = g_capture->capacity ? g_capture->capacity * 2 : 16;
+-    if (capacity > 4096) {
++    size_t extra = (capacity - g_capture->capacity) * sizeof query;
++    if (capacity > 4096 || extra > 8u * 1024u * 1024u - g_query_bytes) {
+       g_capture->valid = 0;
+       return;
+     }
+@@ -86,6 +189,7 @@
+     }
+     g_capture->queries = allocation;
+     g_capture->capacity = capacity;
++    g_query_bytes += extra;
+   }
+   g_capture->queries[g_capture->count++] = query;
+ }
+@@ -127,10 +231,55 @@
+   jsr_coli60_original_object(collider, motion, frame, result, owner, position);
+ }
+ 
++static void graffiti_pos(const float *position, void *result) {
++  if (g_capture && position) {
++    CollisionQuery query = {.kind = 3, .result = result};
++    memcpy(query.first, position, sizeof query.first);
++    record(query);
++  }
++  jsr_coli60_original_graffiti_pos(position, result);
++}
++
++static void graffiti_ignore(const float *position, void *result) {
++  if (g_capture && position) {
++    CollisionQuery query = {.kind = 4, .result = result};
++    memcpy(query.first, position, sizeof query.first);
++    record(query);
++  }
++  jsr_coli60_original_graffiti_ignore(position, result);
++}
++
++static void graffiti_range(void *range, void *result) {
++  if (g_capture && range)
++    record((CollisionQuery){.kind = 5, .collider = range, .result = result});
++  jsr_coli60_original_graffiti_range(range, result);
++}
++
++static void graffiti_enemy_range(const float *position, void *range, void *result) {
++  if (g_capture && position && range) {
++    CollisionQuery query = {.kind = 6, .collider = range, .result = result};
++    memcpy(query.first, position, sizeof query.first);
++    record(query);
++  }
++  jsr_coli60_original_graffiti_enemy_range(position, range, result);
++}
++
++static void follow(void *position, void *result) {
++  if (g_capture && position)
++    record((CollisionQuery){.kind = 7, .position = position, .result = result});
++  jsr_coli60_original_follow(position, result);
++}
++
+ int jsr_collision60_hold(void *player) {
+   CollisionActor *entry = find_actor(player, 0);
+   if (!entry || !entry->valid || !g_matrix || !*g_matrix)
+     return 0;
++  uint32_t identity[4];
++  actor_identity(player, identity);
++  if (memcmp(identity, entry->identity, sizeof identity)) {
++    entry->valid = 0;
++    return 0;
++  }
+   float saved[16];
+   float *matrix = *g_matrix;
+   memcpy(saved, matrix, sizeof saved);
+@@ -141,11 +290,20 @@
+     else if (query->kind == 1)
+       jsr_coli60_original_move(query->collider, query->first, query->second, query->third, query->radius,
+                              query->result, query->owner, query->flags);
+-    else {
++    else if (query->kind == 2) {
+       memcpy(matrix, query->matrix, sizeof saved);
+       jsr_coli60_original_object(query->collider, query->motion, query->frame, query->result, query->owner, query->position);
+       memcpy(matrix, saved, sizeof saved);
+-    }
++    } else if (query->kind == 3)
++      jsr_coli60_original_graffiti_pos(query->first, query->result);
++    else if (query->kind == 4)
++      jsr_coli60_original_graffiti_ignore(query->first, query->result);
++    else if (query->kind == 5)
++      jsr_coli60_original_graffiti_range(query->collider, query->result);
++    else if (query->kind == 6)
++      jsr_coli60_original_graffiti_enemy_range(query->first, query->collider, query->result);
++    else if (query->kind == 7)
++      jsr_coli60_original_follow(query->position, query->result);
+   }
+   return 1;
+ }
+@@ -160,9 +318,17 @@
+     {0x1b6280, {0xf8,0xb5,0x1d,0x46,0x2d,0xed,0x02,0x8b}, ride, &jsr_coli60_ride_tail},
+     {0x1b6478, {0x2d,0xe9,0xf0,0x41,0x2d,0xed,0x02,0x8b}, move, &jsr_coli60_move_tail},
+     {0x1b6de4, {0x2d,0xe9,0xf0,0x41,0x2a,0x4d,0x84,0xb0}, object, &jsr_coli60_object_tail},
++    {0x1bb52c, {0xf0,0xb4,0x28,0xb3,0x09,0xb1,0x00,0x23}, graffiti_pos, &jsr_coli60_graffiti_pos_tail},
++    {0x1bb590, {0xf0,0xb4,0x28,0xb3,0x09,0xb1,0x00,0x23}, graffiti_ignore, &jsr_coli60_graffiti_ignore_tail},
++    {0x1bb630, {0x70,0xb4,0x90,0xb1,0x09,0xb1,0x00,0x23}, graffiti_range, &jsr_coli60_graffiti_range_tail},
++    {0x1bb66c, {0xf0,0xb4,0x12,0xb1,0x4f,0xf0,0xff,0x33}, graffiti_enemy_range, &jsr_coli60_graffiti_enemy_range_tail},
++    {0x1b8d18, {0x70,0xb4,0x09,0xb1,0x00,0x23,0x0b,0x60}, follow, &jsr_coli60_follow_tail},
+   };
+   g_installed = 0;
+   if (module->state != SO_STAGED || module->load_size < 0x63d83c)
++    return 0;
++  static const uint8_t result_prefix[] = {0xf0,0xb5,0x2d,0xed,0x02,0x8b,0x56,0x4c};
++  if (memcmp((uint8_t *)module->load_base + 0x1b2304, result_prefix, sizeof result_prefix))
+     return 0;
+   uintptr_t base = (uintptr_t)module->load_virtbase;
+   for (unsigned index = 0; index < sizeof hooks / sizeof hooks[0]; index++)
+@@ -170,6 +336,8 @@
+       return 0;
+   memcpy(&jsr_coli60_object_literal, (uint8_t *)module->load_base + 0x1b6e94, 4);
+   g_matrix = (float **)(base + 0x63d838);
++  g_result_pool = (const uint32_t *)(base + 0x3d8bd8);
++  g_camera_callback = base + 0x1d90b5;
+   for (unsigned index = 0; index < sizeof hooks / sizeof hooks[0]; index++) {
+     uint32_t stub[] = {0xf000f8df, (uint32_t)(uintptr_t)hooks[index].replacement};
+     memcpy((uint8_t *)module->load_base + hooks[index].offset, stub, sizeof stub);
+@@ -177,6 +345,6 @@
+   }
+   jsr_collision60_reset();
+   g_installed = 1;
+-  debugPrintf("[native60] recorded collision queries renewed every engine frame; no retained result-list pointers\n");
++  debugPrintf("[native60] collision and graffiti queries renewed every engine frame; live-to-replay cache retained\n");
+   return 1;
+ }
+--- a/source/jsr_collision60.h
++++ b/source/jsr_collision60.h
+@@ -5,6 +5,8 @@
+ 
+ int jsr_collision60_install(so_module *module);
+ void jsr_collision60_reset(void);
++void jsr_collision60_tick(void);
++void jsr_collision60_prepare(void *player);
+ void jsr_collision60_begin(void *player);
+ void jsr_collision60_end(void);
+ void jsr_collision60_forget(void *player);
+--- a/source/jsr_collision60_tramp.S
++++ b/source/jsr_collision60_tramp.S
+@@ -36,5 +36,53 @@
+     sub sp, sp, #16
+     tail jsr_coli60_object_tail
+ .size jsr_coli60_original_object, .-jsr_coli60_original_object
++.macro graffiti name, saved:vararg
++.global jsr_coli60_original_graffiti_\name
++.type jsr_coli60_original_graffiti_\name, %function
++.thumb_func
++jsr_coli60_original_graffiti_\name:
++    push {\saved}
++    cbz r0, .Lreturn_\name
++    cbz r1, .Lskip_\name
++    movs r3, #0
++    tail jsr_coli60_graffiti_\name\()_tail
++.Lskip_\name:
++    ldr ip, =jsr_coli60_graffiti_\name\()_tail
++    ldr ip, [ip]
++    add ip, ip, #2
++    bx ip
++.Lreturn_\name:
++    pop {\saved}
++    bx lr
++.size jsr_coli60_original_graffiti_\name, .-jsr_coli60_original_graffiti_\name
++.endm
++graffiti pos, r4-r7
++graffiti ignore, r4-r7
++graffiti range, r4-r6
++.global jsr_coli60_original_graffiti_enemy_range
++.type jsr_coli60_original_graffiti_enemy_range, %function
++.thumb_func
++jsr_coli60_original_graffiti_enemy_range:
++    push {r4-r7}
++    cbz r2, .Lenemy_range_skip
++    mov r3, #-1
++    tail jsr_coli60_graffiti_enemy_range_tail
++.Lenemy_range_skip:
++    ldr ip, =jsr_coli60_graffiti_enemy_range_tail
++    ldr ip, [ip]
++    add ip, ip, #2
++    bx ip
++.size jsr_coli60_original_graffiti_enemy_range, .-jsr_coli60_original_graffiti_enemy_range
++.global jsr_coli60_original_follow
++.type jsr_coli60_original_follow, %function
++.thumb_func
++jsr_coli60_original_follow:
++    push {r4-r6}
++    cbz r1, .Lfollow_tail
++    movs r3, #0
++    str r3, [r1]
++.Lfollow_tail:
++    tail jsr_coli60_follow_tail
++.size jsr_coli60_original_follow, .-jsr_coli60_original_follow
+ .ltorg
+ .section .note.GNU-stack,"",%progbits
+--- a/source/jsr_config.c
++++ b/source/jsr_config.c
+@@ -99,7 +99,7 @@
+ 
+     ROW_R("controls", "moga", "true",
+           "# Native MOGA-style input. Left stick moves; right stick controls the camera.\n"
+-          "# A jumps, B backs out, L/ZL sprays, R/ZR dashes, + pauses.\n"
++          "# A jumps, B backs out, ZL sprays, L centers the camera, R/ZR dashes, + pauses.\n"
+           "# With false, use the legacy touch-coordinate button layout.", CFG_BOOL, NULL),
+     ROW("controls", "layout_height", "720",
+         "# The height of the touch layout the button points below are written\n"
+--- a/source/jsr_engine_clock.c
++++ b/source/jsr_engine_clock.c
+@@ -19,12 +19,14 @@
+     clock->started = 1;
+     clock->last_ns = now;
+     clock->remainder = 0;
++    clock->pending_ns = 0;
+     return;
+   }
+   uint64_t elapsed = now - clock->last_ns;
+   clock->last_ns = now;
+-  if (elapsed > 100000000ull)
+-    elapsed = 100000000ull;
++  clock->pending_ns = elapsed > UINT64_MAX - clock->pending_ns ? UINT64_MAX : clock->pending_ns + elapsed;
++  elapsed = clock->pending_ns > 100000000ull ? 100000000ull : clock->pending_ns;
++  clock->pending_ns -= elapsed;
+   clock->scale = (float)((double)elapsed * 30.0 / 1000000000.0);
+   clock->elapsed_units = elapsed * 30u;
+   clock->remainder += clock->elapsed_units;
+--- a/source/jsr_engine_clock.h
++++ b/source/jsr_engine_clock.h
+@@ -4,7 +4,7 @@
+ #include <stdint.h>
+ 
+ typedef struct {
+-  uint64_t last_ns, remainder, elapsed_units;
++  uint64_t last_ns, remainder, elapsed_units, pending_ns;
+   float scale;
+   unsigned counter_steps;
+   int started;
+--- /dev/null
++++ b/source/jsr_event60.c
+@@ -0,0 +1,163 @@
++#include <limits.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "jsr_event60.h"
++
++float jsr_event60_scale = 1.0f;
++unsigned jsr_event60_ticks = 1;
++uintptr_t jsr_event60_sound_skip;
++uintptr_t jsr_event60_camera0_tail;
++extern void jsr_event60_camera0(void);
++uintptr_t jsr_event60_camera1_tail;
++extern void jsr_event60_camera1(void);
++uintptr_t jsr_event60_camera_reverse_tail;
++extern void jsr_event60_camera_reverse(void);
++uintptr_t jsr_event60_enemy_root_tail;
++extern void jsr_event60_enemy_root(void);
++uintptr_t jsr_event60_enemy_pose_tail;
++extern void jsr_event60_enemy_pose(void);
++uintptr_t jsr_event60_enemy_clip0_tail;
++extern void jsr_event60_enemy_clip0(void);
++uintptr_t jsr_event60_enemy_clip1_tail;
++extern void jsr_event60_enemy_clip1(void);
++uintptr_t jsr_event60_enemy_clip2_tail;
++extern void jsr_event60_enemy_clip2(void);
++uintptr_t jsr_event60_object_root_tail;
++extern void jsr_event60_object_root(void);
++uintptr_t jsr_event60_object_pose0_tail;
++extern void jsr_event60_object_pose0(void);
++uintptr_t jsr_event60_object_pose1_tail;
++extern void jsr_event60_object_pose1(void);
++uintptr_t jsr_event60_object_pose2_tail;
++extern void jsr_event60_object_pose2(void);
++uintptr_t jsr_event60_object_history_tail;
++extern void jsr_event60_object_history(void);
++uintptr_t jsr_event60_player_root_tail;
++extern void jsr_event60_player_root(void);
++uintptr_t jsr_event60_player_pose_tail;
++extern void jsr_event60_player_pose(void);
++uintptr_t jsr_event60_player_clip_tail;
++extern void jsr_event60_player_clip(void);
++uintptr_t jsr_event60_player_blend_tail;
++extern void jsr_event60_player_blend(void);
++uintptr_t jsr_event60_rival_root0_tail;
++extern void jsr_event60_rival_root0(void);
++uintptr_t jsr_event60_rival_clip_tail;
++extern void jsr_event60_rival_clip(void);
++uintptr_t jsr_event60_rival_pose_tail;
++extern void jsr_event60_rival_pose(void);
++uintptr_t jsr_event60_rival_root1_tail;
++extern void jsr_event60_rival_root1(void);
++uintptr_t jsr_event60_rival_reverse_tail;
++extern void jsr_event60_rival_reverse(void);
++uintptr_t jsr_event60_player_sound_tail;
++extern void jsr_event60_player_sound(void);
++
++static uintptr_t g_base;
++static const struct {
++  uintptr_t offset;
++  uint8_t prefix[8];
++  unsigned sound, timer;
++} g_callbacks[] = {
++    {0x163e64, {0xf0,0xb5,0xd0,0xf8,0xd8,0x70,0x8d,0xb0}, 0, 0},
++    {0x1645ac, {0xf0,0xb5,0x04,0x46,0x85,0xb0,0x00,0x20}, 188, 192},
++    {0x16500c, {0x2d,0xe9,0xf0,0x47,0x04,0x46,0x00,0x20}, 184, 188},
++    {0x165654, {0xf0,0xb5,0x04,0x46,0x91,0xb0,0x00,0x20}, 220, 224},
++    {0x16605c, {0xf0,0xb5,0x04,0x46,0x91,0xb0,0x00,0x20}, 204, 208},
++};
++static const struct {
++  uintptr_t offset;
++  uint8_t prefix[16];
++  unsigned length;
++  void *replacement;
++  uintptr_t *tail;
++} g_hooks[] = {
++    {0x164092, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x1f,0x7a}, 12, jsr_event60_camera0, &jsr_event60_camera0_tail},
++    {0x1640ea, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x1f,0x7a}, 12, jsr_event60_camera1, &jsr_event60_camera1_tail},
++    {0x16414c, {0xf7,0xee,0x00,0x7a,0x77,0xee,0x67,0x7a}, 8, jsr_event60_camera_reverse, &jsr_event60_camera_reverse_tail},
++    {0x164600, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_enemy_root, &jsr_event60_enemy_root_tail},
++    {0x164650, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_enemy_pose, &jsr_event60_enemy_pose_tail},
++    {0x16468e, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x2d,0x7a}, 12, jsr_event60_enemy_clip0, &jsr_event60_enemy_clip0_tail},
++    {0x16472c, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_enemy_clip1, &jsr_event60_enemy_clip1_tail},
++    {0x164760, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_enemy_clip2, &jsr_event60_enemy_clip2_tail},
++    {0x165060, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_object_root, &jsr_event60_object_root_tail},
++    {0x165158, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_object_pose0, &jsr_event60_object_pose0_tail},
++    {0x1651ca, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x2c,0x7a}, 12, jsr_event60_object_pose1, &jsr_event60_object_pose1_tail},
++    {0x1651fe, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xe3,0x6e,0xc4,0xed,0x2c,0x7a}, 14, jsr_event60_object_pose2, &jsr_event60_object_pose2_tail},
++    {0x1650b0, {0xf7,0xee,0x00,0x7a,0x94,0xed,0x31,0x7a,0x76,0xee,0xa7,0x7a}, 12, jsr_event60_object_history, &jsr_event60_object_history_tail},
++    {0x1656a8, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_player_root, &jsr_event60_player_root_tail},
++    {0x1656f0, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_player_pose, &jsr_event60_player_pose_tail},
++    {0x165748, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_player_clip, &jsr_event60_player_clip_tail},
++    {0x16575e, {0x76,0xee,0x87,0x6a,0xc4,0xed,0x35,0x6a,0x5b,0x88}, 10, jsr_event60_player_blend, &jsr_event60_player_blend_tail},
++    {0x1660c4, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a}, 8, jsr_event60_rival_root0, &jsr_event60_rival_root0_tail},
++    {0x1660fa, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xd4,0xf8,0xcc,0x00}, 12, jsr_event60_rival_clip, &jsr_event60_rival_clip_tail},
++    {0x166126, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x4a,0x7a}, 12, jsr_event60_rival_pose, &jsr_event60_rival_pose_tail},
++    {0x166162, {0xb7,0xee,0x00,0x7a,0x77,0xee,0x87,0x7a,0xc4,0xed,0x31,0x7a}, 12, jsr_event60_rival_root1, &jsr_event60_rival_root1_tail},
++    {0x16637a, {0xf7,0xee,0x00,0x7a,0x77,0xee,0x67,0x7a,0xf5,0xee,0xc0,0x7a}, 12, jsr_event60_rival_reverse, &jsr_event60_rival_reverse_tail},
++    {0x165792, {0x4f,0xf0,0x0a,0x0e,0xcd,0xf8,0x00,0xe0,0x07,0x20}, 10, jsr_event60_player_sound, &jsr_event60_player_sound_tail},
++};
++
++int jsr_event60_validate(so_module *module) {
++  if (module->state != SO_STAGED)
++    return 0;
++  for (unsigned index = 0; index < sizeof g_callbacks / sizeof g_callbacks[0]; index++) {
++    uintptr_t offset = g_callbacks[index].offset;
++    if (offset > module->load_size || 8 > module->load_size - offset ||
++        memcmp((uint8_t *)module->load_base + offset, g_callbacks[index].prefix, 8))
++      return 0;
++  }
++  for (unsigned index = 0; index < sizeof g_hooks / sizeof g_hooks[0]; index++) {
++    uintptr_t offset = g_hooks[index].offset;
++    unsigned length = g_hooks[index].length;
++    if (offset > module->load_size || length > module->load_size - offset ||
++        memcmp((uint8_t *)module->load_base + offset, g_hooks[index].prefix, length))
++      return 0;
++  }
++  return 1;
++}
++
++void jsr_event60_install(so_module *module) {
++  g_base = (uintptr_t)module->load_virtbase;
++  for (unsigned index = 0; index < sizeof g_hooks / sizeof g_hooks[0]; index++) {
++    uintptr_t offset = g_hooks[index].offset;
++    uint8_t *alias = (uint8_t *)module->load_base + offset;
++    uint16_t instruction[] = {0xf8df, 0xf000};
++    unsigned literal = (offset & 2) ? 6 : 4;
++    uint32_t replacement = (uint32_t)(uintptr_t)g_hooks[index].replacement;
++    if (literal == 6)
++      instruction[1] |= 4;
++    memcpy(alias, instruction, sizeof instruction);
++    memcpy(alias + literal, &replacement, sizeof replacement);
++    *g_hooks[index].tail = (g_base + offset + g_hooks[index].length) | 1u;
++  }
++  jsr_event60_sound_skip = g_base + 0x1657ae + 1;
++}
++
++int jsr_event60_dispatch(void *object, void (*callback)(void *), float scale, unsigned ticks) {
++  for (unsigned index = 0; index < sizeof g_callbacks / sizeof g_callbacks[0]; index++) {
++    if ((uintptr_t)callback != g_base + g_callbacks[index].offset + 1)
++      continue;
++    unsigned timer = g_callbacks[index].timer;
++    if (timer) {
++      uint32_t sound;
++      int32_t remaining;
++      memcpy(&sound, (uint8_t *)object + g_callbacks[index].sound, sizeof sound);
++      memcpy(&remaining, (uint8_t *)object + timer, sizeof remaining);
++      if (sound && remaining >= 0 && remaining < INT_MAX) {
++        remaining += 1 - (int32_t)ticks;
++        memcpy((uint8_t *)object + timer, &remaining, sizeof remaining);
++      }
++    }
++    float previous_scale = jsr_event60_scale;
++    unsigned previous_ticks = jsr_event60_ticks;
++    jsr_event60_scale = scale;
++    jsr_event60_ticks = ticks;
++    callback(object);
++    jsr_event60_scale = previous_scale;
++    jsr_event60_ticks = previous_ticks;
++    return 1;
++  }
++  return 0;
++}
++
+--- /dev/null
++++ b/source/jsr_event60.h
+@@ -0,0 +1,11 @@
++#ifndef JSR_EVENT60_H
++#define JSR_EVENT60_H
++
++#include "so_util.h"
++
++int jsr_event60_validate(so_module *module);
++void jsr_event60_install(so_module *module);
++int jsr_event60_dispatch(void *object, void (*callback)(void *), float scale, unsigned ticks);
++
++#endif
++
+--- /dev/null
++++ b/source/jsr_event60_tramp.S
+@@ -0,0 +1,279 @@
++.syntax unified
++.arch armv8-a
++.fpu neon-fp-armv8
++.thumb
++.text
++.align 2
++.macro return_tail symbol
++    push {ip}
++    push {ip}
++    ldr ip, =\symbol
++    ldr ip, [ip]
++    str ip, [sp, #4]
++    pop {ip, pc}
++.endm
++.macro scaled destination, source, operation
++    push {ip}
++    vpush {d0}
++    ldr ip, =jsr_event60_scale
++    vldr s0, [ip]
++    v\operation\().f32 \destination, \source, s0
++    vpop {d0}
++    pop {ip}
++.endm
++
++.global jsr_event60_camera0
++.type jsr_event60_camera0, %function
++.thumb_func
++jsr_event60_camera0:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #124]
++    return_tail jsr_event60_camera0_tail
++.size jsr_event60_camera0, .-jsr_event60_camera0
++.ltorg
++
++.global jsr_event60_camera1
++.type jsr_event60_camera1, %function
++.thumb_func
++jsr_event60_camera1:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #124]
++    return_tail jsr_event60_camera1_tail
++.size jsr_event60_camera1, .-jsr_event60_camera1
++.ltorg
++
++.global jsr_event60_camera_reverse
++.type jsr_event60_camera_reverse, %function
++.thumb_func
++jsr_event60_camera_reverse:
++    vmov.f32 s15, #1.0
++    scaled s15, s14, sub
++    return_tail jsr_event60_camera_reverse_tail
++.size jsr_event60_camera_reverse, .-jsr_event60_camera_reverse
++.ltorg
++
++.global jsr_event60_enemy_root
++.type jsr_event60_enemy_root, %function
++.thumb_func
++jsr_event60_enemy_root:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_enemy_root_tail
++.size jsr_event60_enemy_root, .-jsr_event60_enemy_root
++.ltorg
++
++.global jsr_event60_enemy_pose
++.type jsr_event60_enemy_pose, %function
++.thumb_func
++jsr_event60_enemy_pose:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_enemy_pose_tail
++.size jsr_event60_enemy_pose, .-jsr_event60_enemy_pose
++.ltorg
++
++.global jsr_event60_enemy_clip0
++.type jsr_event60_enemy_clip0, %function
++.thumb_func
++jsr_event60_enemy_clip0:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #180]
++    return_tail jsr_event60_enemy_clip0_tail
++.size jsr_event60_enemy_clip0, .-jsr_event60_enemy_clip0
++.ltorg
++
++.global jsr_event60_enemy_clip1
++.type jsr_event60_enemy_clip1, %function
++.thumb_func
++jsr_event60_enemy_clip1:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_enemy_clip1_tail
++.size jsr_event60_enemy_clip1, .-jsr_event60_enemy_clip1
++.ltorg
++
++.global jsr_event60_enemy_clip2
++.type jsr_event60_enemy_clip2, %function
++.thumb_func
++jsr_event60_enemy_clip2:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_enemy_clip2_tail
++.size jsr_event60_enemy_clip2, .-jsr_event60_enemy_clip2
++.ltorg
++
++.global jsr_event60_object_root
++.type jsr_event60_object_root, %function
++.thumb_func
++jsr_event60_object_root:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_object_root_tail
++.size jsr_event60_object_root, .-jsr_event60_object_root
++.ltorg
++
++.global jsr_event60_object_pose0
++.type jsr_event60_object_pose0, %function
++.thumb_func
++jsr_event60_object_pose0:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_object_pose0_tail
++.size jsr_event60_object_pose0, .-jsr_event60_object_pose0
++.ltorg
++
++.global jsr_event60_object_pose1
++.type jsr_event60_object_pose1, %function
++.thumb_func
++jsr_event60_object_pose1:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #176]
++    return_tail jsr_event60_object_pose1_tail
++.size jsr_event60_object_pose1, .-jsr_event60_object_pose1
++.ltorg
++
++.global jsr_event60_object_pose2
++.type jsr_event60_object_pose2, %function
++.thumb_func
++jsr_event60_object_pose2:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    ldr r3, [r4, #108]
++    vstr s15, [r4, #176]
++    return_tail jsr_event60_object_pose2_tail
++.size jsr_event60_object_pose2, .-jsr_event60_object_pose2
++.ltorg
++
++.global jsr_event60_object_history
++.type jsr_event60_object_history, %function
++.thumb_func
++jsr_event60_object_history:
++    vmov.f32 s15, #1.0
++    vldr s14, [r4, #196]
++    scaled s15, s13, add
++    return_tail jsr_event60_object_history_tail
++.size jsr_event60_object_history, .-jsr_event60_object_history
++.ltorg
++
++.global jsr_event60_player_root
++.type jsr_event60_player_root, %function
++.thumb_func
++jsr_event60_player_root:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_player_root_tail
++.size jsr_event60_player_root, .-jsr_event60_player_root
++.ltorg
++
++.global jsr_event60_player_pose
++.type jsr_event60_player_pose, %function
++.thumb_func
++jsr_event60_player_pose:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_player_pose_tail
++.size jsr_event60_player_pose, .-jsr_event60_player_pose
++.ltorg
++
++.global jsr_event60_player_clip
++.type jsr_event60_player_clip, %function
++.thumb_func
++jsr_event60_player_clip:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_player_clip_tail
++.size jsr_event60_player_clip, .-jsr_event60_player_clip
++.ltorg
++
++.global jsr_event60_player_blend
++.type jsr_event60_player_blend, %function
++.thumb_func
++jsr_event60_player_blend:
++    scaled s13, s13, add
++    vstr s13, [r4, #212]
++    ldrh r3, [r3, #2]
++    return_tail jsr_event60_player_blend_tail
++.size jsr_event60_player_blend, .-jsr_event60_player_blend
++.ltorg
++
++.global jsr_event60_rival_root0
++.type jsr_event60_rival_root0, %function
++.thumb_func
++jsr_event60_rival_root0:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    return_tail jsr_event60_rival_root0_tail
++.size jsr_event60_rival_root0, .-jsr_event60_rival_root0
++.ltorg
++
++.global jsr_event60_rival_clip
++.type jsr_event60_rival_clip, %function
++.thumb_func
++jsr_event60_rival_clip:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    ldr r0, [r4, #204]
++    return_tail jsr_event60_rival_clip_tail
++.size jsr_event60_rival_clip, .-jsr_event60_rival_clip
++.ltorg
++
++.global jsr_event60_rival_pose
++.type jsr_event60_rival_pose, %function
++.thumb_func
++jsr_event60_rival_pose:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #296]
++    return_tail jsr_event60_rival_pose_tail
++.size jsr_event60_rival_pose, .-jsr_event60_rival_pose
++.ltorg
++
++.global jsr_event60_rival_root1
++.type jsr_event60_rival_root1, %function
++.thumb_func
++jsr_event60_rival_root1:
++    vmov.f32 s14, #1.0
++    scaled s15, s15, add
++    vstr s15, [r4, #196]
++    return_tail jsr_event60_rival_root1_tail
++.size jsr_event60_rival_root1, .-jsr_event60_rival_root1
++.ltorg
++
++.global jsr_event60_rival_reverse
++.type jsr_event60_rival_reverse, %function
++.thumb_func
++jsr_event60_rival_reverse:
++    vmov.f32 s15, #1.0
++    scaled s15, s14, sub
++    vcmpe.f32 s15, #0.0
++    return_tail jsr_event60_rival_reverse_tail
++.size jsr_event60_rival_reverse, .-jsr_event60_rival_reverse
++.ltorg
++
++.global jsr_event60_player_sound
++.type jsr_event60_player_sound, %function
++.thumb_func
++jsr_event60_player_sound:
++    push {r0, r1}
++    mrs r1, APSR
++    ldr r0, =jsr_event60_ticks
++    ldr r0, [r0]
++    cbz r0, 1f
++    msr APSR_nzcvq, r1
++    pop {r0, r1}
++    mov.w lr, #10
++    str lr, [sp]
++    movs r0, #7
++    return_tail jsr_event60_player_sound_tail
++1:
++    msr APSR_nzcvq, r1
++    pop {r0, r1}
++    return_tail jsr_event60_sound_skip
++.size jsr_event60_player_sound, .-jsr_event60_player_sound
++.ltorg
++.section .note.GNU-stack,"",%progbits
++
+--- a/source/jsr_input.c
++++ b/source/jsr_input.c
+@@ -78,6 +78,30 @@
+ static int g_connected;
+ static int g_native_state[13];
+ static int g_native_last_connected = -1;
++static int g_camera_button;
++uintptr_t jsr_input_camera_tail, jsr_input_camera_flag;
++extern int jsr_input_original_camera(void);
++
++static int camera_button(void) {
++  if (g_native_pad)
++    return (g_connected && g_camera_button) ||
++           (jsr_input_camera_flag && *(const int *)jsr_input_camera_flag);
++  return jsr_input_original_camera();
++}
++
++int jsr_input_install(so_module *module) {
++  static const uint8_t prefix[] = {0x08,0xb5,0x0a,0x4b,0x7b,0x44,0x1b,0x68};
++  if (module->state != SO_STAGED || module->load_size < 0x63de6c ||
++      memcmp((uint8_t *)module->load_base + 0x270004, prefix, sizeof prefix))
++    return 0;
++  uintptr_t base = (uintptr_t)module->load_virtbase;
++  jsr_input_camera_tail = base + 0x27000d;
++  jsr_input_camera_flag = base + 0x63de68;
++  uint32_t stub[] = {0xf000f8df, (uint32_t)(uintptr_t)camera_button};
++  memcpy((uint8_t *)module->load_base + 0x270004, stub, sizeof stub);
++  debugPrintf("[input] independent native actions: ZL = graffiti, L = camera center\n");
++  return 1;
++}
+ 
+ int jsr_input_pad_connected(void) {
+   return g_native_pad && g_connected;
+@@ -102,7 +126,7 @@
+     state[3] = !!(buttons & HidNpadButton_Down);
+     state[4] = !!(buttons & HidNpadButton_A);
+     state[5] = !!(buttons & HidNpadButton_B);
+-    state[6] = !!(buttons & (HidNpadButton_L | HidNpadButton_ZL));
++    state[6] = !!(buttons & HidNpadButton_ZL);
+     state[7] = !!(buttons & (HidNpadButton_R | HidNpadButton_ZR));
+     state[8] = !!(buttons & HidNpadButton_Plus);
+     state[9] = native_axis(g_sticks[0]);
+@@ -110,8 +134,10 @@
+     state[11] = native_axis(g_sticks[2]);
+     state[12] = native_axis(-g_sticks[3]);
+   }
+-  int changed = memcmp(state, g_native_state, sizeof state) != 0 ||
++  int camera = g_connected && !!(buttons & HidNpadButton_L);
++  int changed = camera != g_camera_button || memcmp(state, g_native_state, sizeof state) != 0 ||
+                 g_connected != g_native_last_connected;
++  g_camera_button = camera;
+   g_nat.updateInput(g_jni_env, g_lib_cls, changed,
+                     state[0], state[1], state[2], state[3], state[4], state[5],
+                     state[6], state[7], state[8], state[9], state[10], state[11], state[12]);
+@@ -187,6 +213,7 @@
+   g_connected = g_pad_ready && padIsConnected(&g_pad);
+   g_pad_prev = 0;
+   g_native_last_connected = -1;
++  g_camera_button = 0;
+   memset(g_native_state, 0, sizeof g_native_state);
+   g_native_pad = rt_config_bool("controls", "moga") && g_nat.updateInput != NULL;
+   if (!g_native_pad)
+--- /dev/null
++++ b/source/jsr_input_tramp.S
+@@ -0,0 +1,20 @@
++.syntax unified
++.arch armv8-a
++.fpu neon-fp-armv8
++.thumb
++.text
++.align 2
++.global jsr_input_original_camera
++.type jsr_input_original_camera, %function
++.thumb_func
++jsr_input_original_camera:
++    push {r3, lr}
++    ldr r3, =jsr_input_camera_flag
++    ldr r3, [r3]
++    ldr r3, [r3]
++    ldr ip, =jsr_input_camera_tail
++    ldr ip, [ip]
++    bx ip
++.size jsr_input_original_camera, .-jsr_input_original_camera
++.ltorg
++.section .note.GNU-stack,"",%progbits
+--- a/source/jsr_main.c
++++ b/source/jsr_main.c
+@@ -119,6 +119,8 @@
+   if (left)
+     debugPrintf("[boot] WARNING: %d import(s) of %s unresolved\n", left, lib);
+   so_fix_kuser_helpers(&g_mod);
++  if (!jsr_input_install(&g_mod))
++    fatal_error("The game library does not match the supported controller profile.");
+   jsr_timing_install(&g_mod);
+   if (!jsr_visuals_install(&g_mod))
+     debugPrintf("[visuals] distance profile not applied; original visibility retained\n");
+--- a/source/jsr_native60.c
++++ b/source/jsr_native60.c
+@@ -1,12 +1,14 @@
+ #include <limits.h>
+ #include <math.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <switch.h>
+ 
+ #include "jsr.h"
+ #include "jsr_collision60.h"
+ #include "jsr_engine_fall.h"
++#include "jsr_event60.h"
+ #include "jsr_native60.h"
+ #include "jsr_pose60.h"
+ #include "rt_applet.h"
+@@ -15,7 +17,7 @@
+ 
+ #define SECOND_NS 1000000000ull
+ #define PLAYER_SLOTS 16
+-#define PLAYER_TIMERS 7
++#define PLAYER_TIMERS 9
+ #define SCRIPT_SLOTS 32
+ 
+ uintptr_t jsr_n60_motion_tail, jsr_n60_motion_ex_tail;
+@@ -48,8 +50,9 @@
+   int32_t expected;
+ } PlayerTimer;
+ 
+-typedef struct {
++typedef struct Player {
+   void *player;
++  struct Player *next;
+   uint64_t frame;
+   uint32_t state;
+   PlayerTimer timers[PLAYER_TIMERS];
+@@ -58,8 +61,9 @@
+   float vertical_correction, horizontal_correction;
+ } Player;
+ 
+-typedef struct {
++typedef struct ScriptClock {
+   void *object;
++  struct ScriptClock *next;
+   uint64_t frame;
+   uint64_t sampled_frame;
+   int64_t remainder;
+@@ -67,6 +71,8 @@
+   uint8_t previous_buttons;
+   int has_buttons;
+   void *recorded_player;
++  unsigned traces;
++  uintptr_t traced_action;
+   unsigned kind;
+   int32_t state;
+ } ScriptClock;
+@@ -81,14 +87,32 @@
+ } NativeHook;
+ 
+ static const unsigned g_timer_offsets[PLAYER_TIMERS] = {
+-    0xf0, 0x10c, 0x110, 0x510, 0x5d4, 0x880, 0x888,
++    0xf0, 0x10c, 0x110, 0x510, 0x5d4, 0x880, 0x888, 0x884, 0x890,
+ };
+ static JsrEngineClock g_clock;
+ static Player g_players[PLAYER_SLOTS];
++static Player *g_player_overflow;
+ static ScriptClock g_scripts[SCRIPT_SLOTS];
++static ScriptClock *g_script_overflow;
+ static uintptr_t g_player_callback, g_camera_callback;
+ static uintptr_t g_key_callback, g_practice_callback;
+ static uintptr_t g_demo_callback, g_scene_callback, g_radio_callback;
++static uintptr_t g_lesson_callback, g_event_manager_callback, g_event_telop_callback;
++static uintptr_t g_game_base;
++static void *(*g_action_get)(unsigned);
++static int g_recorded_world_step, g_recorded_world_active;
++static unsigned long g_recorded_world_ticks;
++static const struct {
++  uintptr_t offset;
++  uint8_t prefix[8];
++} g_graffiti_profiles[] = {
++    {0x1e3fd0, {0xc3,0x6e,0xd3,0xf8,0x48,0x21,0x09,0x32}},
++    {0x1e3f7c, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0xd3,0xf8}},
++    {0x1e3f30, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0xd3,0xf8}},
++    {0x1e4f24, {0x2d,0xe9,0xf8,0x43,0x04,0x46,0x2d,0xed}},
++    {0x1e51c4, {0xf8,0xb5,0x06,0x46,0x6a,0x20,0xca,0xf7}},
++    {0x1e4ed0, {0x10,0xb5,0x83,0x69,0x04,0x46,0x1b,0x6f}},
++};
+ static uint32_t *g_area;
+ static uint32_t g_last_area;
+ static uint64_t g_frame, g_deadline, g_present_remainder;
+@@ -129,9 +153,29 @@
+     if (!available && (!player->player || player->frame + 120 < g_frame))
+       available = player;
+   }
+-  if (!create || !available)
++  for (Player **link = &g_player_overflow; *link;) {
++    Player *player = *link;
++    if (player->player == object)
++      return player;
++    if (player->frame + 120 < g_frame) {
++      *link = player->next;
++      free(player);
++    } else {
++      link = &player->next;
++    }
++  }
++  if (!create)
+     return NULL;
++  if (!available) {
++    available = calloc(1, sizeof *available);
++    if (!available)
++      return NULL;
++    available->next = g_player_overflow;
++    g_player_overflow = available;
++  }
++  Player *next = available->next;
+   memset(available, 0, sizeof *available);
++  available->next = next;
+   available->player = object;
+   return available;
+ }
+@@ -141,6 +185,17 @@
+ }
+ 
+ void jsr_native60_reset(void) {
++  jsr_audio_catchup(0);
++  while (g_script_overflow) {
++    ScriptClock *clock = g_script_overflow;
++    g_script_overflow = clock->next;
++    free(clock);
++  }
++  while (g_player_overflow) {
++    Player *player = g_player_overflow;
++    g_player_overflow = player->next;
++    free(player);
++  }
+   jsr_collision60_reset();
+   jsr_pose60_reset();
+   jsr_engine_clock_reset(&g_clock);
+@@ -149,6 +204,8 @@
+   g_deadline = g_present_remainder = g_frame = 0;
+   g_present_hz = 0;
+   g_active = g_scaled = g_collision_depth = 0;
++  g_recorded_world_step = g_recorded_world_active = 0;
++  g_recorded_world_ticks = 0;
+   g_falling = NULL;
+ }
+ 
+@@ -267,8 +324,36 @@
+     if (!available && (!clock->object || clock->frame + 120 < g_frame))
+       available = clock;
+   }
++  for (ScriptClock **link = &g_script_overflow; *link;) {
++    ScriptClock *clock = *link;
++    if (clock->object == object && clock->kind == kind) {
++      if (clock->state != state || clock->frame + 1 < g_frame) {
++        clock->sampled_frame = UINT64_MAX;
++        clock->has_buttons = 0;
++        clock->recorded_player = NULL;
++      }
++      clock->state = state;
++      clock->frame = g_frame;
++      return clock;
++    }
++    if (clock->frame + 120 < g_frame) {
++      *link = clock->next;
++      free(clock);
++    } else {
++      link = &clock->next;
++    }
++  }
++  if (!available) {
++    available = calloc(1, sizeof *available);
++    if (available) {
++      available->next = g_script_overflow;
++      g_script_overflow = available;
++    }
++  }
+   if (available) {
++    ScriptClock *next = available->next;
+     memset(available, 0, sizeof *available);
++    available->next = next;
+     available->object = object;
+     available->kind = kind;
+     available->state = state;
+@@ -308,47 +393,69 @@
+   if (mode < 2 || mode > 4)
+     return 0;
+   ScriptClock *clock = script_at(key, 1, mode);
+-  if (!clock)
+-    return 0;
+-  if (clock->recorded_player != player) {
+-    jsr_collision60_forget(player);
++  if (clock && clock->recorded_player != player) {
+     debugPrintf("[native60] recorded player=%p key=%p mode=%ld: original 30 Hz physics/camera\n",
+                 player, key, (long)mode);
+     clock->recorded_player = player;
++    clock->traces = 0;
++    clock->traced_action = 0;
+   }
+   int is_player = (uintptr_t)callback == g_player_callback;
+-  if (script_steps(clock, 1)) {
++  if (clock ? script_steps(clock, 1) : legacy_steps()) {
+     g_recorded_calls++;
+     uint8_t *buttons = key;
+     uint8_t previous_buttons = buttons[0x74];
+-    if (clock->has_buttons)
++    if (clock && clock->has_buttons)
+       buttons[0x74] = clock->previous_buttons;
++    uintptr_t action = (uintptr_t)(uint32_t)read_int(player, 0x6c);
++    int spray_edge = is_player && ((buttons[0x6d] & ~buttons[0x74]) & 4);
++    if (is_player && clock && clock->traces < 128 &&
++        (clock->traced_action != action || ((buttons[0x6d] & ~buttons[0x74]) & 4))) {
++      void *camera = (void *)(uintptr_t)(uint32_t)read_int(player, 0x850);
++      debugPrintf("[replay] player=%p area=%lu action=%lx motion=%ld key=%02x/%02x record=%lx target=%lx cans=%ld pos=%.2f,%.2f,%.2f camera=%ld\n",
++                  player, (unsigned long)g_last_area, (unsigned long)(action - g_game_base),
++                  (long)read_int(player, 0x78), buttons[0x6d], buttons[0x74],
++                  (unsigned long)(uint32_t)read_int(key, 0x70),
++                  (unsigned long)(uint32_t)read_int(player, 0x274), (long)read_int(player, 0x3c8),
++                  (double)read_float(player, 0xb8), (double)read_float(player, 0xbc),
++                  (double)read_float(player, 0xc0),
++                  camera ? (long)read_int(camera, 0xc4) : 0L);
++      clock->traced_action = action;
++      clock->traces++;
++    }
+     int previous = g_scaled;
+     g_scaled = 0;
+     if (is_player) {
+       jsr_pose60_begin(player);
+-      jsr_collision60_begin(player);
+-    }
++    }
++    jsr_collision60_begin(object);
+     callback(object);
++    if (spray_edge && clock && clock->traces < 128) {
++      debugPrintf("[replay] spray outcome player=%p action=%lx motion=%ld target=%lx available=%ld graffiti=%ld\n",
++                  player, (unsigned long)((uintptr_t)(uint32_t)read_int(player, 0x6c) - g_game_base),
++                  (long)read_int(player, 0x78), (unsigned long)(uint32_t)read_int(player, 0x274),
++                  (long)read_int(player, 0x28c), (long)read_int(player, 0x294));
++      clock->traces++;
++    }
++    jsr_collision60_end();
+     if (is_player) {
+       jsr_pose60_end();
+-      jsr_collision60_end();
+     }
+     g_scaled = previous;
+-    if (clock->has_buttons && buttons[0x74] == clock->previous_buttons)
++    if (clock && clock->has_buttons && buttons[0x74] == clock->previous_buttons)
+       buttons[0x74] = previous_buttons;
+   } else {
+-    if (is_player && !jsr_collision60_hold(player) && !(g_collision_hold_failures++ % 600))
+-      debugPrintf("[native60] recorded collision renewal unavailable: player=%p; physics held to shared script tick\n", player);
++    if (!jsr_collision60_hold(object) && !(g_collision_hold_failures++ % 600))
++      debugPrintf("[native60] recorded collision renewal unavailable: actor=%p camera=%d; physics held to shared script tick\n", object, !is_player);
+     g_recorded_holds++;
+   }
+-  jsr_pose60_phase(player, (float)((double)clock->remainder / (double)SECOND_NS));
++  jsr_pose60_phase(player, (float)((double)((g_clock.remainder + 29) % SECOND_NS) / (double)SECOND_NS));
+   return 1;
+ }
+ 
+ static void scripted_key(void *object, void (*callback)(void *), int32_t mode) {
+   ScriptClock *clock = script_at(object, 1, mode);
+-  if (!clock || script_steps(clock, 1)) {
++  if (clock ? script_steps(clock, 1) : legacy_steps()) {
+     callback(object);
+     if (clock) {
+       clock->previous_buttons = ((uint8_t *)object)[0x74];
+@@ -363,12 +470,12 @@
+ static void practice_step(void *object, void (*callback)(void *)) {
+   int32_t state = read_int(object, 0x6c);
+   ScriptClock *clock = script_at(object, 2, state);
+-  if (!clock || (state != 2 && state != 4)) {
++  if (state != 2 && state != 4) {
+     callback(object);
+     return;
+   }
+   int32_t previous = read_int(object, 0x7c);
+-  unsigned steps = script_steps(clock, 3);
++  unsigned steps = clock ? script_steps(clock, 3) : legacy_steps();
+   int32_t prepared = previous;
+   if (previous >= 0 && previous <= 90) {
+     prepared = previous + (int32_t)steps - 1;
+@@ -381,18 +488,69 @@
+ }
+ 
+ void jsr_n60_dispatch(void *object, void (*callback)(void *)) {
++  if (g_recorded_world_step) {
++    int player = (uintptr_t)callback == g_player_callback;
++    int actor = player || (uintptr_t)callback == g_camera_callback;
++    int previous = g_scaled;
++    g_scaled = 0;
++    if (player)
++      jsr_pose60_begin(object);
++    if (actor)
++      jsr_collision60_begin(object);
++    callback(object);
++    if (actor)
++      jsr_collision60_end();
++    if (player)
++      jsr_pose60_end();
++    g_scaled = previous;
++    return;
++  }
++  if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
++    jsr_collision60_prepare(object);
+   if (!g_active) {
++    if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
++      jsr_collision60_begin(object);
+     callback(object);
++    if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
++      jsr_collision60_end();
+     return;
+   }
+   uintptr_t address = (uintptr_t)callback;
+-  if (address == g_demo_callback || address == g_radio_callback) {
++  for (unsigned index = 0; index < sizeof g_graffiti_profiles / sizeof g_graffiti_profiles[0]; index++) {
++    if (address == g_game_base + g_graffiti_profiles[index].offset + 1) {
++      if (legacy_steps()) {
++        int previous = g_scaled;
++        g_scaled = 0;
++        callback(object);
++        g_scaled = previous;
++      }
++      return;
++    }
++  }
++  if (address == g_demo_callback || address == g_radio_callback ||
++      address == g_event_manager_callback || address == g_event_telop_callback) {
+     if (legacy_steps()) {
+       int previous = g_scaled;
+       g_scaled = 0;
+       callback(object);
+       g_scaled = previous;
+     }
++    return;
++  }
++  if (address == g_lesson_callback) {
++    int state;
++    int16_t narrow_state;
++    memcpy(&narrow_state, (uint8_t *)object + 0x6c, sizeof narrow_state);
++    state = narrow_state;
++    if (state == 2) {
++      int32_t remaining = read_int(object, 0x70);
++      if (remaining >= 0 && remaining < INT_MAX)
++        write_int(object, 0x70, remaining + 1 - (int32_t)legacy_steps());
++    }
++    int previous = g_scaled;
++    g_scaled = 1;
++    callback(object);
++    g_scaled = previous;
+     return;
+   }
+   if (address == g_scene_callback) {
+@@ -412,7 +570,6 @@
+     return;
+   if (address == g_player_callback) {
+     jsr_pose60_forget(object);
+-    jsr_collision60_forget(object);
+   }
+   if (address == g_key_callback) {
+     int32_t mode = read_int(object, 0x84);
+@@ -434,7 +591,8 @@
+   if (address != g_player_callback && address != g_camera_callback) {
+     int previous = g_scaled;
+     g_scaled = 1;
+-    callback(object);
++    if (!jsr_event60_dispatch(object, callback, g_clock.scale, legacy_steps()))
++      callback(object);
+     g_scaled = previous;
+     g_legacy_calls++;
+     return;
+@@ -453,13 +611,32 @@
+       player->vertical_correction = 0.0f;
+       player->horizontal_correction = 0.0f;
+       prepare_timers(player, previous, prepared);
++      float timer = read_float(object, 0x870);
++      float prepared_timer = timer;
++      if (isfinite(timer) && timer > 0.0f) {
++        prepared_timer = timer + 1.0f - g_clock.scale;
++        write_float(object, 0x870, prepared_timer);
++      }
++      jsr_collision60_begin(object);
+       callback(object);
++      jsr_collision60_end();
++      if (prepared_timer != timer && read_float(object, 0x870) == prepared_timer)
++        write_float(object, 0x870, timer);
+       finish_timers(player, previous, prepared);
+     } else {
+-      callback(object);
++      if (legacy_steps()) {
++        g_scaled = 0;
++        jsr_collision60_begin(object);
++        callback(object);
++        jsr_collision60_end();
++      } else {
++        jsr_collision60_hold(object);
++      }
+     }
+   } else {
++    jsr_collision60_begin(object);
+     callback(object);
++    jsr_collision60_end();
+   }
+   g_scaled = previous_scaled;
+   g_fast_calls++;
+@@ -584,12 +761,37 @@
+     jsr_n60_original_stage();
+     return;
+   }
+-  for (unsigned step = 0; step < g_clock.counter_steps; step++)
++  for (unsigned step = 0; step < legacy_steps(); step++)
+     jsr_n60_original_stage();
+ }
+ 
+ static void hooked_exec(void) {
+-  jsr_original_exec();
++  void *root = g_active && g_action_get ? g_action_get(106) : NULL;
++  void *key = root && (uintptr_t)(uint32_t)read_int(root, 0x08) == g_player_callback ?
++              (void *)(uintptr_t)(uint32_t)read_int(root, 0x18) : NULL;
++  int mode = key && (uintptr_t)(uint32_t)read_int(key, 0x08) == g_key_callback ? read_int(key, 0x84) : 0;
++  int recorded = mode >= 2 && mode <= 4;
++  if (recorded != g_recorded_world_active) {
++    debugPrintf("[native60] recorded world: %s (root key mode=%d); visual poses remain native 60 Hz\n",
++                recorded ? "original 30 Hz action/collision domain" : "live engine-time adapters", mode);
++    jsr_pose60_reset();
++    g_recorded_world_active = recorded;
++    g_recorded_world_ticks = 0;
++  }
++  if (!recorded || legacy_steps()) {
++    if (recorded && !(g_recorded_world_ticks++ % 30))
++      debugPrintf("[replay-world] tick=%lu mode=%d player=%p frame=%ld cans=%ld pos=%.2f,%.2f,%.2f\n",
++                  g_recorded_world_ticks, mode, root, (long)read_int(root, 0x98),
++                  (long)read_int(root, 0x3c8), (double)read_float(root, 0xb8),
++                  (double)read_float(root, 0xbc), (double)read_float(root, 0xc0));
++    jsr_pose60_tick();
++    jsr_collision60_tick();
++    g_recorded_world_step = recorded;
++    jsr_original_exec();
++    g_recorded_world_step = 0;
++  }
++  if (recorded)
++    jsr_pose60_present((float)((double)((g_clock.remainder + 29) % SECOND_NS) / (double)SECOND_NS));
+   if (g_active && !(g_frame % 600))
+     debugPrintf("[native60] frame=%llu scale=%.4f fast=%lu legacy=%lu motion=%lu collision=%lu recorded=%lu held=%lu\n",
+                 (unsigned long long)g_frame, (double)g_clock.scale, g_fast_calls,
+@@ -653,14 +855,25 @@
+     uintptr_t offset;
+     uint8_t prefix[8];
+   } script_profiles[] = {
++      {0x1af658, {0x40,0xf6,0x05,0x23,0x98,0x42,0x05,0xd8}},
+       {0x185938, {0xf0,0xb5,0xfe,0x4c,0xfe,0x4b,0xab,0xb0}},
+       {0x1867fc, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x02,0x2b}},
+       {0x1ecec0, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x07,0x2b}},
++      {0x1eed9c, {0x10,0xb5,0xb0,0xf9,0x6c,0x30,0x04,0x46}},
++      {0x167934, {0x2d,0xe9,0xf0,0x4f,0xdf,0xf8,0x68,0x65}},
++      {0x166ab4, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x02,0x2b}},
+   };
+   for (unsigned index = 0; index < sizeof script_profiles / sizeof script_profiles[0]; index++) {
+     uint8_t *alias = staged(module, script_profiles[index].offset, 8);
+     if (!alias || memcmp(alias, script_profiles[index].prefix, 8)) {
+       debugPrintf("[native60] unsupported demo/scene/radio profile; no hooks installed\n");
++      return 0;
++    }
++  }
++  for (unsigned index = 0; index < sizeof g_graffiti_profiles / sizeof g_graffiti_profiles[0]; index++) {
++    uint8_t *alias = staged(module, g_graffiti_profiles[index].offset, 8);
++    if (!alias || memcmp(alias, g_graffiti_profiles[index].prefix, 8)) {
++      debugPrintf("[native60] unsupported graffiti action profile; no hooks installed\n");
+       return 0;
+     }
+   }
+@@ -677,10 +890,15 @@
+   g_area = (uint32_t *)so_try_find_addr_rx(module, "u32StageArea");
+   if (!jsr_timer_count || !g_area)
+     return 0;
++  if (!jsr_event60_validate(module))
++    return 0;
+   if (!jsr_collision60_install(module)) {
+     debugPrintf("[native60] unsupported collision registration profile; original timing retained\n");
+     return 0;
+   }
++  jsr_event60_install(module);
++  g_game_base = base;
++  g_action_get = (void *)(base + 0x1af659);
+   g_player_callback = base + 0x1d71c8 + 1;
+   g_camera_callback = base + 0x1d90b4 + 1;
+   g_key_callback = base + 0x1e7d38 + 1;
+@@ -688,6 +906,9 @@
+   g_demo_callback = base + 0x185938 + 1;
+   g_scene_callback = base + 0x1867fc + 1;
+   g_radio_callback = base + 0x1ecec0 + 1;
++  g_lesson_callback = base + 0x1eed9c + 1;
++  g_event_manager_callback = base + 0x167934 + 1;
++  g_event_telop_callback = base + 0x166ab4 + 1;
+   for (unsigned index = 0; index < sizeof hooks / sizeof hooks[0]; index++) {
+     NativeHook *hook = &hooks[index];
+     uint8_t *alias = staged(module, hook->offset, hook->length);
+@@ -731,6 +952,17 @@
+   g_deadline += g_present_remainder / hz;
+   g_present_remainder %= hz;
+   if (g_active != active || (g_area && g_last_area != *g_area)) {
++    while (g_player_overflow) {
++      Player *player = g_player_overflow;
++      g_player_overflow = player->next;
++      free(player);
++    }
++    while (g_script_overflow) {
++      ScriptClock *clock = g_script_overflow;
++      g_script_overflow = clock->next;
++      free(clock);
++    }
++    jsr_audio_catchup(0);
+     jsr_collision60_reset();
+     jsr_pose60_reset();
+     jsr_engine_clock_reset(&g_clock);
+@@ -741,7 +973,16 @@
+     debugPrintf("[native60] mode: %s\n", active ? "engine-time experiment" : "original timing");
+   }
+   g_active = active;
++  int starting = active && !g_clock.started;
+   jsr_engine_clock_begin(&g_clock, now, !active);
++  if (starting) {
++    g_clock.elapsed_units = SECOND_NS;
++    g_clock.counter_steps = 1;
++    g_clock.scale = 1.0f;
++    debugPrintf("[native60] initial logic tick: input/player/camera/stage primed before collision-pool renewal\n");
++  }
++  if (g_clock.pending_ns)
++    jsr_audio_catchup(1);
+   g_frame++;
+   return 1;
+ }
+@@ -751,6 +992,8 @@
+   unsigned passes = g_active ? (unsigned)((saved.elapsed_units + SECOND_NS - 30) / SECOND_NS) : 1;
+   if (passes < 2) {
+     step(env, cls);
++    if (!g_clock.pending_ns)
++      jsr_audio_catchup(0);
+     return;
+   }
+   if (passes > 3)
+@@ -772,4 +1015,6 @@
+     step(env, cls);
+   }
+   g_clock = saved;
+-}
++  if (!g_clock.pending_ns)
++    jsr_audio_catchup(0);
++}
+--- a/source/jsr_pose60.c
++++ b/source/jsr_pose60.c
+@@ -8,6 +8,8 @@
+ 
+ #define POSE_LIMIT 4096u
+ #define POSE_MEMORY_LIMIT (16u * 1024u * 1024u)
++#define SNAPSHOT_BUDGET (32u * 1024u * 1024u)
++#define PLAYER_LIMIT 128u
+ 
+ typedef struct {
+   void *object, *destination;
+@@ -36,6 +38,7 @@
+   unsigned commands, motions, buffers, previous_commands;
+   unsigned command_capacity, motion_capacity, buffer_capacity, previous_capacity;
+   int valid;
++  uint64_t last_used;
+   float phase;
+   PoseCommand *command, *previous;
+   PoseMotion *motion;
+@@ -56,35 +59,62 @@
+ static uintptr_t g_game_base;
+ static unsigned long g_resampled;
+ static int g_installed, g_drawing, g_evaluation_depth;
++static uint64_t g_generation;
++static unsigned g_player_count;
++static size_t g_snapshot_bytes;
++
++static void release_player(PosePlayer *entry) {
++  for (unsigned index = 0; index < entry->buffer_capacity; index++) {
++    g_snapshot_bytes -= entry->buffer[index].capacity * 2;
++    free(entry->buffer[index].initial_data);
++    free(entry->buffer[index].restore_data);
++  }
++  free(entry->buffer);
++  free(entry->command);
++  free(entry->previous);
++  free(entry->motion);
++  free(entry);
++  g_player_count--;
++}
++
++void jsr_pose60_tick(void) {
++  g_generation++;
++  for (PosePlayer **link = &g_players; *link;) {
++    PosePlayer *entry = *link;
++    if (entry != g_capture && entry->last_used + 2 < g_generation) {
++      *link = entry->next;
++      release_player(entry);
++    } else {
++      link = &entry->next;
++    }
++  }
++}
+ 
+ void jsr_pose60_reset(void) {
+   while (g_players) {
+     PosePlayer *entry = g_players;
+     g_players = entry->next;
+-    for (unsigned index = 0; index < entry->buffer_capacity; index++) {
+-      free(entry->buffer[index].initial_data);
+-      free(entry->buffer[index].restore_data);
+-    }
+-    free(entry->buffer);
+-    free(entry->command);
+-    free(entry->previous);
+-    free(entry->motion);
+-    free(entry);
++    release_player(entry);
+   }
+   g_capture = NULL;
+   g_resampled = 0;
+   g_drawing = g_evaluation_depth = 0;
++  g_generation = 0;
+ }
+ 
+ static PosePlayer *find_player(void *player, int create) {
+   for (PosePlayer *entry = g_players; entry; entry = entry->next)
+-    if (entry->player == player)
++    if (entry->player == player) {
++      entry->last_used = g_generation;
+       return entry;
+-  if (!create)
++    }
++  if (!create || g_player_count >= PLAYER_LIMIT)
+     return NULL;
+   PosePlayer *entry = calloc(1, sizeof *entry);
+   if (entry) {
+     entry->player = player;
++    entry->last_used = g_generation;
++    g_player_count++;
+     entry->next = g_players;
+     g_players = entry;
+   }
+@@ -130,14 +160,28 @@
+ void jsr_pose60_end(void) { g_capture = NULL; }
+ 
+ void jsr_pose60_forget(void *player) {
+-  PosePlayer *entry = find_player(player, 0);
+-  if (entry)
+-    entry->valid = 0;
++  for (PosePlayer **link = &g_players; *link; link = &(*link)->next) {
++    PosePlayer *entry = *link;
++    if (entry->player == player) {
++      if (entry == g_capture || g_drawing) {
++        entry->valid = 0;
++      } else {
++        *link = entry->next;
++        release_player(entry);
++      }
++      return;
++    }
++  }
+ }
+ 
+ void jsr_pose60_phase(void *player, float phase) {
+   PosePlayer *entry = find_player(player, 0);
+   if (entry)
++    entry->phase = isfinite(phase) && phase > 0.0f && phase < 1.0f ? phase : 0.0f;
++}
++
++void jsr_pose60_present(float phase) {
++  for (PosePlayer *entry = g_players; entry; entry = entry->next)
+     entry->phase = isfinite(phase) && phase > 0.0f && phase < 1.0f ? phase : 0.0f;
+ }
+ 
+@@ -193,6 +237,9 @@
+     return 0;
+   PoseBuffer *buffer = &entry->buffer[entry->buffers];
+   if (buffer->capacity < size) {
++    size_t extra = (size - buffer->capacity) * 2;
++    if (extra > SNAPSHOT_BUDGET - g_snapshot_bytes)
++      return 0;
+     uint8_t *initial = malloc(size), *restore = malloc(size);
+     if (!initial || !restore) {
+       free(initial);
+@@ -204,6 +251,7 @@
+     buffer->initial_data = initial;
+     buffer->restore_data = restore;
+     buffer->capacity = size;
++    g_snapshot_bytes += extra;
+   }
+   buffer->header = command->destination;
+   buffer->data = data;
+--- a/source/jsr_pose60.h
++++ b/source/jsr_pose60.h
+@@ -5,9 +5,11 @@
+ 
+ int jsr_pose60_install(so_module *module);
+ void jsr_pose60_reset(void);
++void jsr_pose60_tick(void);
+ void jsr_pose60_begin(void *player);
+ void jsr_pose60_end(void);
+ void jsr_pose60_phase(void *player, float phase);
++void jsr_pose60_present(float phase);
+ void jsr_pose60_forget(void *player);
+ void jsr_pose60_motion(const void *motion, float frame, float step, int flags, int extended, float start, float end);
+ 

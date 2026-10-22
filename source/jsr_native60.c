@@ -1,12 +1,14 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <switch.h>
 
 #include "jsr.h"
 #include "jsr_collision60.h"
 #include "jsr_engine_fall.h"
+#include "jsr_event60.h"
 #include "jsr_native60.h"
 #include "jsr_pose60.h"
 #include "rt_applet.h"
@@ -15,7 +17,7 @@
 
 #define SECOND_NS 1000000000ull
 #define PLAYER_SLOTS 16
-#define PLAYER_TIMERS 7
+#define PLAYER_TIMERS 9
 #define SCRIPT_SLOTS 32
 
 uintptr_t jsr_n60_motion_tail, jsr_n60_motion_ex_tail;
@@ -48,8 +50,9 @@ typedef struct {
   int32_t expected;
 } PlayerTimer;
 
-typedef struct {
+typedef struct Player {
   void *player;
+  struct Player *next;
   uint64_t frame;
   uint32_t state;
   PlayerTimer timers[PLAYER_TIMERS];
@@ -58,8 +61,9 @@ typedef struct {
   float vertical_correction, horizontal_correction;
 } Player;
 
-typedef struct {
+typedef struct ScriptClock {
   void *object;
+  struct ScriptClock *next;
   uint64_t frame;
   uint64_t sampled_frame;
   int64_t remainder;
@@ -67,6 +71,8 @@ typedef struct {
   uint8_t previous_buttons;
   int has_buttons;
   void *recorded_player;
+  unsigned traces;
+  uintptr_t traced_action;
   unsigned kind;
   int32_t state;
 } ScriptClock;
@@ -81,13 +87,32 @@ typedef struct {
 } NativeHook;
 
 static const unsigned g_timer_offsets[PLAYER_TIMERS] = {
-    0xf0, 0x10c, 0x110, 0x510, 0x5d4, 0x880, 0x888,
+    0xf0, 0x10c, 0x110, 0x510, 0x5d4, 0x880, 0x888, 0x884, 0x890,
 };
 static JsrEngineClock g_clock;
 static Player g_players[PLAYER_SLOTS];
+static Player *g_player_overflow;
 static ScriptClock g_scripts[SCRIPT_SLOTS];
+static ScriptClock *g_script_overflow;
 static uintptr_t g_player_callback, g_camera_callback;
 static uintptr_t g_key_callback, g_practice_callback;
+static uintptr_t g_demo_callback, g_scene_callback, g_radio_callback;
+static uintptr_t g_lesson_callback, g_event_manager_callback, g_event_telop_callback;
+static uintptr_t g_game_base;
+static void *(*g_action_get)(unsigned);
+static int g_recorded_world_step, g_recorded_world_active;
+static unsigned long g_recorded_world_ticks;
+static const struct {
+  uintptr_t offset;
+  uint8_t prefix[8];
+} g_graffiti_profiles[] = {
+    {0x1e3fd0, {0xc3,0x6e,0xd3,0xf8,0x48,0x21,0x09,0x32}},
+    {0x1e3f7c, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0xd3,0xf8}},
+    {0x1e3f30, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0xd3,0xf8}},
+    {0x1e4f24, {0x2d,0xe9,0xf8,0x43,0x04,0x46,0x2d,0xed}},
+    {0x1e51c4, {0xf8,0xb5,0x06,0x46,0x6a,0x20,0xca,0xf7}},
+    {0x1e4ed0, {0x10,0xb5,0x83,0x69,0x04,0x46,0x1b,0x6f}},
+};
 static uint32_t *g_area;
 static uint32_t g_last_area;
 static uint64_t g_frame, g_deadline, g_present_remainder;
@@ -97,6 +122,7 @@ static void *g_falling;
 static float g_fall_gravity;
 static unsigned long g_fast_calls, g_legacy_calls, g_motion_calls, g_collision_calls;
 static unsigned long g_recorded_calls, g_recorded_holds;
+static unsigned long g_collision_hold_failures;
 
 static float read_float(const void *object, unsigned offset) {
   float value;
@@ -127,9 +153,29 @@ static Player *player_at(void *object, int create) {
     if (!available && (!player->player || player->frame + 120 < g_frame))
       available = player;
   }
-  if (!create || !available)
+  for (Player **link = &g_player_overflow; *link;) {
+    Player *player = *link;
+    if (player->player == object)
+      return player;
+    if (player->frame + 120 < g_frame) {
+      *link = player->next;
+      free(player);
+    } else {
+      link = &player->next;
+    }
+  }
+  if (!create)
     return NULL;
+  if (!available) {
+    available = calloc(1, sizeof *available);
+    if (!available)
+      return NULL;
+    available->next = g_player_overflow;
+    g_player_overflow = available;
+  }
+  Player *next = available->next;
   memset(available, 0, sizeof *available);
+  available->next = next;
   available->player = object;
   return available;
 }
@@ -139,6 +185,17 @@ int jsr_native60_requested(void) {
 }
 
 void jsr_native60_reset(void) {
+  jsr_audio_catchup(0);
+  while (g_script_overflow) {
+    ScriptClock *clock = g_script_overflow;
+    g_script_overflow = clock->next;
+    free(clock);
+  }
+  while (g_player_overflow) {
+    Player *player = g_player_overflow;
+    g_player_overflow = player->next;
+    free(player);
+  }
   jsr_collision60_reset();
   jsr_pose60_reset();
   jsr_engine_clock_reset(&g_clock);
@@ -147,6 +204,8 @@ void jsr_native60_reset(void) {
   g_deadline = g_present_remainder = g_frame = 0;
   g_present_hz = 0;
   g_active = g_scaled = g_collision_depth = 0;
+  g_recorded_world_step = g_recorded_world_active = 0;
+  g_recorded_world_ticks = 0;
   g_falling = NULL;
 }
 
@@ -265,8 +324,36 @@ static ScriptClock *script_at(void *object, unsigned kind, int32_t state) {
     if (!available && (!clock->object || clock->frame + 120 < g_frame))
       available = clock;
   }
+  for (ScriptClock **link = &g_script_overflow; *link;) {
+    ScriptClock *clock = *link;
+    if (clock->object == object && clock->kind == kind) {
+      if (clock->state != state || clock->frame + 1 < g_frame) {
+        clock->sampled_frame = UINT64_MAX;
+        clock->has_buttons = 0;
+        clock->recorded_player = NULL;
+      }
+      clock->state = state;
+      clock->frame = g_frame;
+      return clock;
+    }
+    if (clock->frame + 120 < g_frame) {
+      *link = clock->next;
+      free(clock);
+    } else {
+      link = &clock->next;
+    }
+  }
+  if (!available) {
+    available = calloc(1, sizeof *available);
+    if (available) {
+      available->next = g_script_overflow;
+      g_script_overflow = available;
+    }
+  }
   if (available) {
+    ScriptClock *next = available->next;
     memset(available, 0, sizeof *available);
+    available->next = next;
     available->object = object;
     available->kind = kind;
     available->state = state;
@@ -276,14 +363,18 @@ static ScriptClock *script_at(void *object, unsigned kind, int32_t state) {
   return available;
 }
 
+static unsigned legacy_steps(void) {
+  uint64_t previous = (g_clock.remainder + SECOND_NS - g_clock.elapsed_units % SECOND_NS) % SECOND_NS;
+  return g_clock.counter_steps + (g_clock.remainder + 29 >= SECOND_NS) - (previous + 29 >= SECOND_NS);
+}
+
 static unsigned script_steps(ScriptClock *clock, unsigned limit) {
   if (clock->sampled_frame == g_frame)
     return clock->steps;
   clock->sampled_frame = g_frame;
-  clock->remainder += (int64_t)g_clock.elapsed_units;
-  int64_t available = (clock->remainder + 29) / (int64_t)SECOND_NS;
-  unsigned steps = available > limit ? limit : (unsigned)available;
-  clock->remainder -= (int64_t)steps * (int64_t)SECOND_NS;
+  unsigned available = legacy_steps();
+  unsigned steps = available > limit ? limit : available;
+  clock->remainder = (int64_t)((g_clock.remainder + 29) % SECOND_NS);
   clock->steps = steps;
   return steps;
 }
@@ -302,45 +393,69 @@ static int scripted_player(void *object, void (*callback)(void *)) {
   if (mode < 2 || mode > 4)
     return 0;
   ScriptClock *clock = script_at(key, 1, mode);
-  if (!clock)
-    return 0;
-  if (clock->recorded_player != player) {
-    jsr_collision60_forget(player);
+  if (clock && clock->recorded_player != player) {
     debugPrintf("[native60] recorded player=%p key=%p mode=%ld: original 30 Hz physics/camera\n",
                 player, key, (long)mode);
     clock->recorded_player = player;
+    clock->traces = 0;
+    clock->traced_action = 0;
   }
   int is_player = (uintptr_t)callback == g_player_callback;
-  if (script_steps(clock, 1) || (is_player && !jsr_collision60_hold(player))) {
+  if (clock ? script_steps(clock, 1) : legacy_steps()) {
     g_recorded_calls++;
     uint8_t *buttons = key;
     uint8_t previous_buttons = buttons[0x74];
-    if (clock->has_buttons)
+    if (clock && clock->has_buttons)
       buttons[0x74] = clock->previous_buttons;
+    uintptr_t action = (uintptr_t)(uint32_t)read_int(player, 0x6c);
+    int spray_edge = is_player && ((buttons[0x6d] & ~buttons[0x74]) & 4);
+    if (is_player && clock && clock->traces < 128 &&
+        (clock->traced_action != action || ((buttons[0x6d] & ~buttons[0x74]) & 4))) {
+      void *camera = (void *)(uintptr_t)(uint32_t)read_int(player, 0x850);
+      debugPrintf("[replay] player=%p area=%lu action=%lx motion=%ld key=%02x/%02x record=%lx target=%lx cans=%ld pos=%.2f,%.2f,%.2f camera=%ld\n",
+                  player, (unsigned long)g_last_area, (unsigned long)(action - g_game_base),
+                  (long)read_int(player, 0x78), buttons[0x6d], buttons[0x74],
+                  (unsigned long)(uint32_t)read_int(key, 0x70),
+                  (unsigned long)(uint32_t)read_int(player, 0x274), (long)read_int(player, 0x3c8),
+                  (double)read_float(player, 0xb8), (double)read_float(player, 0xbc),
+                  (double)read_float(player, 0xc0),
+                  camera ? (long)read_int(camera, 0xc4) : 0L);
+      clock->traced_action = action;
+      clock->traces++;
+    }
     int previous = g_scaled;
     g_scaled = 0;
     if (is_player) {
       jsr_pose60_begin(player);
-      jsr_collision60_begin(player);
     }
+    jsr_collision60_begin(object);
     callback(object);
+    if (spray_edge && clock && clock->traces < 128) {
+      debugPrintf("[replay] spray outcome player=%p action=%lx motion=%ld target=%lx available=%ld graffiti=%ld\n",
+                  player, (unsigned long)((uintptr_t)(uint32_t)read_int(player, 0x6c) - g_game_base),
+                  (long)read_int(player, 0x78), (unsigned long)(uint32_t)read_int(player, 0x274),
+                  (long)read_int(player, 0x28c), (long)read_int(player, 0x294));
+      clock->traces++;
+    }
+    jsr_collision60_end();
     if (is_player) {
       jsr_pose60_end();
-      jsr_collision60_end();
     }
     g_scaled = previous;
-    if (clock->has_buttons && buttons[0x74] == clock->previous_buttons)
+    if (clock && clock->has_buttons && buttons[0x74] == clock->previous_buttons)
       buttons[0x74] = previous_buttons;
   } else {
+    if (!jsr_collision60_hold(object) && !(g_collision_hold_failures++ % 600))
+      debugPrintf("[native60] recorded collision renewal unavailable: actor=%p camera=%d; physics held to shared script tick\n", object, !is_player);
     g_recorded_holds++;
   }
-  jsr_pose60_phase(player, (float)((double)clock->remainder / (double)SECOND_NS));
+  jsr_pose60_phase(player, (float)((double)((g_clock.remainder + 29) % SECOND_NS) / (double)SECOND_NS));
   return 1;
 }
 
 static void scripted_key(void *object, void (*callback)(void *), int32_t mode) {
   ScriptClock *clock = script_at(object, 1, mode);
-  if (!clock || script_steps(clock, 1)) {
+  if (clock ? script_steps(clock, 1) : legacy_steps()) {
     callback(object);
     if (clock) {
       clock->previous_buttons = ((uint8_t *)object)[0x74];
@@ -355,12 +470,12 @@ static void scripted_key(void *object, void (*callback)(void *), int32_t mode) {
 static void practice_step(void *object, void (*callback)(void *)) {
   int32_t state = read_int(object, 0x6c);
   ScriptClock *clock = script_at(object, 2, state);
-  if (!clock || (state != 2 && state != 4)) {
+  if (state != 2 && state != 4) {
     callback(object);
     return;
   }
   int32_t previous = read_int(object, 0x7c);
-  unsigned steps = script_steps(clock, 3);
+  unsigned steps = clock ? script_steps(clock, 3) : legacy_steps();
   int32_t prepared = previous;
   if (previous >= 0 && previous <= 90) {
     prepared = previous + (int32_t)steps - 1;
@@ -373,16 +488,88 @@ static void practice_step(void *object, void (*callback)(void *)) {
 }
 
 void jsr_n60_dispatch(void *object, void (*callback)(void *)) {
-  if (!g_active) {
+  if (g_recorded_world_step) {
+    int player = (uintptr_t)callback == g_player_callback;
+    int actor = player || (uintptr_t)callback == g_camera_callback;
+    int previous = g_scaled;
+    g_scaled = 0;
+    if (player)
+      jsr_pose60_begin(object);
+    if (actor)
+      jsr_collision60_begin(object);
     callback(object);
+    if (actor)
+      jsr_collision60_end();
+    if (player)
+      jsr_pose60_end();
+    g_scaled = previous;
+    return;
+  }
+  if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
+    jsr_collision60_prepare(object);
+  if (!g_active) {
+    if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
+      jsr_collision60_begin(object);
+    callback(object);
+    if ((uintptr_t)callback == g_player_callback || (uintptr_t)callback == g_camera_callback)
+      jsr_collision60_end();
     return;
   }
   uintptr_t address = (uintptr_t)callback;
+  for (unsigned index = 0; index < sizeof g_graffiti_profiles / sizeof g_graffiti_profiles[0]; index++) {
+    if (address == g_game_base + g_graffiti_profiles[index].offset + 1) {
+      if (legacy_steps()) {
+        int previous = g_scaled;
+        g_scaled = 0;
+        callback(object);
+        g_scaled = previous;
+      }
+      return;
+    }
+  }
+  if (address == g_demo_callback || address == g_radio_callback ||
+      address == g_event_manager_callback || address == g_event_telop_callback) {
+    if (legacy_steps()) {
+      int previous = g_scaled;
+      g_scaled = 0;
+      callback(object);
+      g_scaled = previous;
+    }
+    return;
+  }
+  if (address == g_lesson_callback) {
+    int state;
+    int16_t narrow_state;
+    memcpy(&narrow_state, (uint8_t *)object + 0x6c, sizeof narrow_state);
+    state = narrow_state;
+    if (state == 2) {
+      int32_t remaining = read_int(object, 0x70);
+      if (remaining >= 0 && remaining < INT_MAX)
+        write_int(object, 0x70, remaining + 1 - (int32_t)legacy_steps());
+    }
+    int previous = g_scaled;
+    g_scaled = 1;
+    callback(object);
+    g_scaled = previous;
+    return;
+  }
+  if (address == g_scene_callback) {
+    int32_t state = read_int(object, 0x6c);
+    if (state == 2 || state == 3) {
+      float frame = read_float(object, 0x70);
+      if (isfinite(frame))
+        write_float(object, 0x70, frame + g_clock.scale - 1.0f);
+    }
+    int previous = g_scaled;
+    g_scaled = 0;
+    callback(object);
+    g_scaled = previous;
+    return;
+  }
   if ((address == g_player_callback || address == g_camera_callback) && scripted_player(object, callback))
     return;
   if (address == g_player_callback) {
     jsr_pose60_forget(object);
-    jsr_collision60_forget(object);
   }
   if (address == g_key_callback) {
     int32_t mode = read_int(object, 0x84);
@@ -404,7 +591,8 @@ void jsr_n60_dispatch(void *object, void (*callback)(void *)) {
   if (address != g_player_callback && address != g_camera_callback) {
     int previous = g_scaled;
     g_scaled = 1;
-    callback(object);
+    if (!jsr_event60_dispatch(object, callback, g_clock.scale, legacy_steps()))
+      callback(object);
     g_scaled = previous;
     g_legacy_calls++;
     return;
@@ -423,13 +611,32 @@ void jsr_n60_dispatch(void *object, void (*callback)(void *)) {
       player->vertical_correction = 0.0f;
       player->horizontal_correction = 0.0f;
       prepare_timers(player, previous, prepared);
+      float timer = read_float(object, 0x870);
+      float prepared_timer = timer;
+      if (isfinite(timer) && timer > 0.0f) {
+        prepared_timer = timer + 1.0f - g_clock.scale;
+        write_float(object, 0x870, prepared_timer);
+      }
+      jsr_collision60_begin(object);
       callback(object);
+      jsr_collision60_end();
+      if (prepared_timer != timer && read_float(object, 0x870) == prepared_timer)
+        write_float(object, 0x870, timer);
       finish_timers(player, previous, prepared);
     } else {
-      callback(object);
+      if (legacy_steps()) {
+        g_scaled = 0;
+        jsr_collision60_begin(object);
+        callback(object);
+        jsr_collision60_end();
+      } else {
+        jsr_collision60_hold(object);
+      }
     }
   } else {
+    jsr_collision60_begin(object);
     callback(object);
+    jsr_collision60_end();
   }
   g_scaled = previous_scaled;
   g_fast_calls++;
@@ -554,12 +761,37 @@ static void hooked_stage(void) {
     jsr_n60_original_stage();
     return;
   }
-  for (unsigned step = 0; step < g_clock.counter_steps; step++)
+  for (unsigned step = 0; step < legacy_steps(); step++)
     jsr_n60_original_stage();
 }
 
 static void hooked_exec(void) {
-  jsr_original_exec();
+  void *root = g_active && g_action_get ? g_action_get(106) : NULL;
+  void *key = root && (uintptr_t)(uint32_t)read_int(root, 0x08) == g_player_callback ?
+              (void *)(uintptr_t)(uint32_t)read_int(root, 0x18) : NULL;
+  int mode = key && (uintptr_t)(uint32_t)read_int(key, 0x08) == g_key_callback ? read_int(key, 0x84) : 0;
+  int recorded = mode >= 2 && mode <= 4;
+  if (recorded != g_recorded_world_active) {
+    debugPrintf("[native60] recorded world: %s (root key mode=%d); visual poses remain native 60 Hz\n",
+                recorded ? "original 30 Hz action/collision domain" : "live engine-time adapters", mode);
+    jsr_pose60_reset();
+    g_recorded_world_active = recorded;
+    g_recorded_world_ticks = 0;
+  }
+  if (!recorded || legacy_steps()) {
+    if (recorded && !(g_recorded_world_ticks++ % 30))
+      debugPrintf("[replay-world] tick=%lu mode=%d player=%p frame=%ld cans=%ld pos=%.2f,%.2f,%.2f\n",
+                  g_recorded_world_ticks, mode, root, (long)read_int(root, 0x98),
+                  (long)read_int(root, 0x3c8), (double)read_float(root, 0xb8),
+                  (double)read_float(root, 0xbc), (double)read_float(root, 0xc0));
+    jsr_pose60_tick();
+    jsr_collision60_tick();
+    g_recorded_world_step = recorded;
+    jsr_original_exec();
+    g_recorded_world_step = 0;
+  }
+  if (recorded)
+    jsr_pose60_present((float)((double)((g_clock.remainder + 29) % SECOND_NS) / (double)SECOND_NS));
   if (g_active && !(g_frame % 600))
     debugPrintf("[native60] frame=%llu scale=%.4f fast=%lu legacy=%lu motion=%lu collision=%lu recorded=%lu held=%lu\n",
                 (unsigned long long)g_frame, (double)g_clock.scale, g_fast_calls,
@@ -619,6 +851,32 @@ int jsr_native60_install(so_module *module) {
     debugPrintf("[native60] unsupported scripted-input/practice profile; no hooks installed\n");
     return 0;
   }
+  static const struct {
+    uintptr_t offset;
+    uint8_t prefix[8];
+  } script_profiles[] = {
+      {0x1af658, {0x40,0xf6,0x05,0x23,0x98,0x42,0x05,0xd8}},
+      {0x185938, {0xf0,0xb5,0xfe,0x4c,0xfe,0x4b,0xab,0xb0}},
+      {0x1867fc, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x02,0x2b}},
+      {0x1ecec0, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x07,0x2b}},
+      {0x1eed9c, {0x10,0xb5,0xb0,0xf9,0x6c,0x30,0x04,0x46}},
+      {0x167934, {0x2d,0xe9,0xf0,0x4f,0xdf,0xf8,0x68,0x65}},
+      {0x166ab4, {0x10,0xb5,0xc3,0x6e,0x04,0x46,0x02,0x2b}},
+  };
+  for (unsigned index = 0; index < sizeof script_profiles / sizeof script_profiles[0]; index++) {
+    uint8_t *alias = staged(module, script_profiles[index].offset, 8);
+    if (!alias || memcmp(alias, script_profiles[index].prefix, 8)) {
+      debugPrintf("[native60] unsupported demo/scene/radio profile; no hooks installed\n");
+      return 0;
+    }
+  }
+  for (unsigned index = 0; index < sizeof g_graffiti_profiles / sizeof g_graffiti_profiles[0]; index++) {
+    uint8_t *alias = staged(module, g_graffiti_profiles[index].offset, 8);
+    if (!alias || memcmp(alias, g_graffiti_profiles[index].prefix, 8)) {
+      debugPrintf("[native60] unsupported graffiti action profile; no hooks installed\n");
+      return 0;
+    }
+  }
   const uintptr_t literal_offsets[] = {0x1afe48, 0x1c47ec, 0x1c47f0};
   uint32_t *literal_values[] = {(uint32_t *)&jsr_exec_literal,
                                &jsr_n60_stage_literals[0], &jsr_n60_stage_literals[1]};
@@ -632,14 +890,25 @@ int jsr_native60_install(so_module *module) {
   g_area = (uint32_t *)so_try_find_addr_rx(module, "u32StageArea");
   if (!jsr_timer_count || !g_area)
     return 0;
+  if (!jsr_event60_validate(module))
+    return 0;
   if (!jsr_collision60_install(module)) {
     debugPrintf("[native60] unsupported collision registration profile; original timing retained\n");
     return 0;
   }
+  jsr_event60_install(module);
+  g_game_base = base;
+  g_action_get = (void *)(base + 0x1af659);
   g_player_callback = base + 0x1d71c8 + 1;
   g_camera_callback = base + 0x1d90b4 + 1;
   g_key_callback = base + 0x1e7d38 + 1;
   g_practice_callback = base + 0x1ca1b8 + 1;
+  g_demo_callback = base + 0x185938 + 1;
+  g_scene_callback = base + 0x1867fc + 1;
+  g_radio_callback = base + 0x1ecec0 + 1;
+  g_lesson_callback = base + 0x1eed9c + 1;
+  g_event_manager_callback = base + 0x167934 + 1;
+  g_event_telop_callback = base + 0x166ab4 + 1;
   for (unsigned index = 0; index < sizeof hooks / sizeof hooks[0]; index++) {
     NativeHook *hook = &hooks[index];
     uint8_t *alias = staged(module, hook->offset, hook->length);
@@ -660,7 +929,7 @@ int jsr_native60_install(so_module *module) {
   jsr_native60_reset();
   debugPrintf("[native60] experimental engine-time adapters installed; interpolation OFF\n");
   debugPrintf("[native60] all action callbacks per present; stage clock at 30 Hz; unmapped per-tick systems remain experimental\n");
-  debugPrintf("[native60] recorded keys, players and attached cameras share original 30 Hz steps; practice waits 30 Hz; live input and rendering per present\n");
+  debugPrintf("[native60] recorded keys/players/cameras, demo commands and radio share global 30 Hz ticks; scene evaluation and live input per present\n");
   return 1;
 }
 
@@ -683,6 +952,17 @@ int jsr_native60_begin(void) {
   g_deadline += g_present_remainder / hz;
   g_present_remainder %= hz;
   if (g_active != active || (g_area && g_last_area != *g_area)) {
+    while (g_player_overflow) {
+      Player *player = g_player_overflow;
+      g_player_overflow = player->next;
+      free(player);
+    }
+    while (g_script_overflow) {
+      ScriptClock *clock = g_script_overflow;
+      g_script_overflow = clock->next;
+      free(clock);
+    }
+    jsr_audio_catchup(0);
     jsr_collision60_reset();
     jsr_pose60_reset();
     jsr_engine_clock_reset(&g_clock);
@@ -693,7 +973,16 @@ int jsr_native60_begin(void) {
     debugPrintf("[native60] mode: %s\n", active ? "engine-time experiment" : "original timing");
   }
   g_active = active;
+  int starting = active && !g_clock.started;
   jsr_engine_clock_begin(&g_clock, now, !active);
+  if (starting) {
+    g_clock.elapsed_units = SECOND_NS;
+    g_clock.counter_steps = 1;
+    g_clock.scale = 1.0f;
+    debugPrintf("[native60] initial logic tick: input/player/camera/stage primed before collision-pool renewal\n");
+  }
+  if (g_clock.pending_ns)
+    jsr_audio_catchup(1);
   g_frame++;
   return 1;
 }
@@ -703,6 +992,8 @@ void jsr_native60_run(void (*step)(void *, void *), void *env, void *cls) {
   unsigned passes = g_active ? (unsigned)((saved.elapsed_units + SECOND_NS - 30) / SECOND_NS) : 1;
   if (passes < 2) {
     step(env, cls);
+    if (!g_clock.pending_ns)
+      jsr_audio_catchup(0);
     return;
   }
   if (passes > 3)
@@ -724,4 +1015,6 @@ void jsr_native60_run(void (*step)(void *, void *), void *env, void *cls) {
     step(env, cls);
   }
   g_clock = saved;
+  if (!g_clock.pending_ns)
+    jsr_audio_catchup(0);
 }

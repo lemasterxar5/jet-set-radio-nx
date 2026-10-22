@@ -1,0 +1,117 @@
+{
+  "baseline_archive": "C:\\Users\\emi\\Documents\\Codex\\2026-10-18\\crea-un-bypass-para-la-deteccion-2\\outputs\\build-202610211727-before-audit-fixes\\JSR_NX_source.zip",
+  "baseline_archive_sha256": "bd5dea9dc707a7b3e562c84c50f6b9bf2bfe8a75b7cf4d6700372d5a8e2039e9",
+  "baseline_build": "202610211727",
+  "target_build": "202610220305",
+  "comparison": "UTF-8 text; CRLF/LF-only differences ignored; delivered files retain exact target bytes",
+  "changes": [
+    {
+      "path": "runtime/source/rt_audout.c",
+      "status": "modified",
+      "before_sha256": "bb78e4700cd86f8772e12af447c777c872ba985b6c47a062874eac1729a659eb",
+      "after_sha256": "b50233100a32a9dc76f8ca6d116538658cf30bc581769b616e253a26bf812d62"
+    },
+    {
+      "path": "source/jsr.h",
+      "status": "modified",
+      "before_sha256": "8a9dc2e037ce396796a8fab0666ce76e4d8fc376083c3aa05fc0ab3557a8c96b",
+      "after_sha256": "c7f462c80e401a6956b6fe9a2cf9a35065eef6344deb59065f51cddef7c5630b"
+    },
+    {
+      "path": "source/jsr_audio.c",
+      "status": "modified",
+      "before_sha256": "98c4a3a2597d1b1282453c38c9f5c84447fab4e154f4d5963e21b438a693d4c9",
+      "after_sha256": "3981cbd4b6a8c5974304a720a79b8e7089e8e433841067f51007be9bcc50e09b"
+    },
+    {
+      "path": "source/jsr_collision60.c",
+      "status": "modified",
+      "before_sha256": "a6ccfe97c678d0437526e3753f8d736fbfb15ca239da8b4384e93bf332346c8d",
+      "after_sha256": "2af34d24aad0c12ab54717db8cc6846a98a5bdd43a1b5e4c70ed44dd8507a2a4"
+    },
+    {
+      "path": "source/jsr_collision60.h",
+      "status": "modified",
+      "before_sha256": "6f9c7d1c50483092da40a027b4c5bfb72d705ffbdce51d9ae504eb2970e5fcd0",
+      "after_sha256": "7b8ac7b5bc8dedc46dea721b821e3349384390ace5a09837637c48ca455dc905"
+    },
+    {
+      "path": "source/jsr_collision60_tramp.S",
+      "status": "modified",
+      "before_sha256": "f8afc2502c29029e3ef4003b53be5289f49bf302c248777c89f0bd763c6424a8",
+      "after_sha256": "470b75adae81b19043a6ce02edce9acd19ee186698806d520ebd8e2a3932a526"
+    },
+    {
+      "path": "source/jsr_config.c",
+      "status": "modified",
+      "before_sha256": "33cfcf7884253ec10916c02c28eb90dbf01cc6313aeb9c2b2808c3e746eef5ec",
+      "after_sha256": "0666d07dc159eaaf236b9daf999891c306d2e4fad4451e79791deab87370cd26"
+    },
+    {
+      "path": "source/jsr_engine_clock.c",
+      "status": "modified",
+      "before_sha256": "1caf967d039febe66e3bc735e1bc0da537ee4bd95c0eae50465a381244031ccc",
+      "after_sha256": "67708c20b9cb2476c68bb664d2d8d16781c797c197d458bf237d97560ea24dcf"
+    },
+    {
+      "path": "source/jsr_engine_clock.h",
+      "status": "modified",
+      "before_sha256": "6cf10ea069c02f1cc9fe023b49b55d62ee25c0786a8ee8dd1a933d4a4da0409b",
+      "after_sha256": "301d492b63393f5e93491162c4b877878d161ac2ffa081fa3ec9e63f81086a16"
+    },
+    {
+      "path": "source/jsr_event60.c",
+      "status": "added",
+      "before_sha256": null,
+      "after_sha256": "96434f5bbdfb506cb693349287567e82e154278335b49dbf9c225f3e55a65d38"
+    },
+    {
+      "path": "source/jsr_event60.h",
+      "status": "added",
+      "before_sha256": null,
+      "after_sha256": "1e37fcdaa8c1c287d89eeab24df994199cc97c19461a29f7e3f5a829d000b789"
+    },
+    {
+      "path": "source/jsr_event60_tramp.S",
+      "status": "added",
+      "before_sha256": null,
+      "after_sha256": "9ad25b5d8a6abad0663c2d07763db4de4def1888faa41e1a6e7f1f5454b1fa3d"
+    },
+    {
+      "path": "source/jsr_input.c",
+      "status": "modified",
+      "before_sha256": "6d6d27fefc21e78c39f3151e8ad8c92dad84d43b1004989951986d7dfd50bbca",
+      "after_sha256": "cc92fc175f5adda50f1f7e450974e8c25c1fea5e8a5ceeeca5ba8124b4b0bcdc"
+    },
+    {
+      "path": "source/jsr_input_tramp.S",
+      "status": "added",
+      "before_sha256": null,
+      "after_sha256": "4aa538ed2d8c6c3abaef8003f14887ddeff01c1726148caaf9ad252250c2f5c7"
+    },
+    {
+      "path": "source/jsr_main.c",
+      "status": "modified",
+      "before_sha256": "107fd06e59f8efafb1e821791996fb9a5796d802d75a3633f4a13dd3e93f66a3",
+      "after_sha256": "05d6bb7207e31b43106ab1550b738b7356479d1677b81ec40bab3e38cccd8586"
+    },
+    {
+      "path": "source/jsr_native60.c",
+      "status": "modified",
+      "before_sha256": "8ae5d8cba431663e2e946afc39b93ed5122c226b1862e81974e757463d9c289d",
+      "after_sha256": "e3cc62b0161ff4a7341de63c5968416ec091c0bd3f42fa804a7346cd4e2911a9"
+    },
+    {
+      "path": "source/jsr_pose60.c",
+      "status": "modified",
+      "before_sha256": "d6902e555f97f6ae9d1c8014bd8c4cc78279829b474eaea16d33553532758254",
+      "after_sha256": "c0b4fce17ca7d9a199042ced04537de5c43331e964147cf637ff872c8a269659"
+    },
+    {
+      "path": "source/jsr_pose60.h",
+      "status": "modified",
+      "before_sha256": "3851a289a1a905e7cc4509d2224e940a2d73e3764c1943e3d3e19e83bfc4779e",
+      "after_sha256": "f58e2c8f2ce1449c68ab8520086ea1d9d0f7fdd85a3fe8e8c13bdc0460945c8b"
+    }
+  ]
+}

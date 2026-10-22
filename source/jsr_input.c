@@ -78,6 +78,30 @@ static int g_native_pad;
 static int g_connected;
 static int g_native_state[13];
 static int g_native_last_connected = -1;
+static int g_camera_button;
+uintptr_t jsr_input_camera_tail, jsr_input_camera_flag;
+extern int jsr_input_original_camera(void);
+
+static int camera_button(void) {
+  if (g_native_pad)
+    return (g_connected && g_camera_button) ||
+           (jsr_input_camera_flag && *(const int *)jsr_input_camera_flag);
+  return jsr_input_original_camera();
+}
+
+int jsr_input_install(so_module *module) {
+  static const uint8_t prefix[] = {0x08,0xb5,0x0a,0x4b,0x7b,0x44,0x1b,0x68};
+  if (module->state != SO_STAGED || module->load_size < 0x63de6c ||
+      memcmp((uint8_t *)module->load_base + 0x270004, prefix, sizeof prefix))
+    return 0;
+  uintptr_t base = (uintptr_t)module->load_virtbase;
+  jsr_input_camera_tail = base + 0x27000d;
+  jsr_input_camera_flag = base + 0x63de68;
+  uint32_t stub[] = {0xf000f8df, (uint32_t)(uintptr_t)camera_button};
+  memcpy((uint8_t *)module->load_base + 0x270004, stub, sizeof stub);
+  debugPrintf("[input] independent native actions: ZL = graffiti, L = camera center\n");
+  return 1;
+}
 
 int jsr_input_pad_connected(void) {
   return g_native_pad && g_connected;
@@ -102,7 +126,7 @@ static void send_native(u64 buttons) {
     state[3] = !!(buttons & HidNpadButton_Down);
     state[4] = !!(buttons & HidNpadButton_A);
     state[5] = !!(buttons & HidNpadButton_B);
-    state[6] = !!(buttons & (HidNpadButton_L | HidNpadButton_ZL));
+    state[6] = !!(buttons & HidNpadButton_ZL);
     state[7] = !!(buttons & (HidNpadButton_R | HidNpadButton_ZR));
     state[8] = !!(buttons & HidNpadButton_Plus);
     state[9] = native_axis(g_sticks[0]);
@@ -110,8 +134,10 @@ static void send_native(u64 buttons) {
     state[11] = native_axis(g_sticks[2]);
     state[12] = native_axis(-g_sticks[3]);
   }
-  int changed = memcmp(state, g_native_state, sizeof state) != 0 ||
+  int camera = g_connected && !!(buttons & HidNpadButton_L);
+  int changed = camera != g_camera_button || memcmp(state, g_native_state, sizeof state) != 0 ||
                 g_connected != g_native_last_connected;
+  g_camera_button = camera;
   g_nat.updateInput(g_jni_env, g_lib_cls, changed,
                     state[0], state[1], state[2], state[3], state[4], state[5],
                     state[6], state[7], state[8], state[9], state[10], state[11], state[12]);
@@ -187,6 +213,7 @@ void jsr_input_init(void) {
   g_connected = g_pad_ready && padIsConnected(&g_pad);
   g_pad_prev = 0;
   g_native_last_connected = -1;
+  g_camera_button = 0;
   memset(g_native_state, 0, sizeof g_native_state);
   g_native_pad = rt_config_bool("controls", "moga") && g_nat.updateInput != NULL;
   if (!g_native_pad)

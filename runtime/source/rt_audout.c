@@ -97,8 +97,11 @@ int rt_audout_open(void) {
   for (int i = 0; i < NBUF; i++) {
     if (!g_pcm[i])
       g_pcm[i] = memalign(0x1000, BUF_BYTES);
-    if (!g_pcm[i])
+    if (!g_pcm[i]) {
+      audoutStopAudioOut();
+      audoutExit();
       return -1;
+    }
     memset(g_pcm[i], 0, BUF_BYTES);
     g_bufs[i].buffer = (u64)(uintptr_t)g_pcm[i];
     g_bufs[i].buffer_size = BUF_BYTES;

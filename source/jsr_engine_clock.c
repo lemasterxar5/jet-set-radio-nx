@@ -19,12 +19,14 @@ void jsr_engine_clock_begin(JsrEngineClock *clock, uint64_t now, int paused) {
     clock->started = 1;
     clock->last_ns = now;
     clock->remainder = 0;
+    clock->pending_ns = 0;
     return;
   }
   uint64_t elapsed = now - clock->last_ns;
   clock->last_ns = now;
-  if (elapsed > 100000000ull)
-    elapsed = 100000000ull;
+  clock->pending_ns = elapsed > UINT64_MAX - clock->pending_ns ? UINT64_MAX : clock->pending_ns + elapsed;
+  elapsed = clock->pending_ns > 100000000ull ? 100000000ull : clock->pending_ns;
+  clock->pending_ns -= elapsed;
   clock->scale = (float)((double)elapsed * 30.0 / 1000000000.0);
   clock->elapsed_units = elapsed * 30u;
   clock->remainder += clock->elapsed_units;

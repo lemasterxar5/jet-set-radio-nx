@@ -8,6 +8,8 @@
 
 #define POSE_LIMIT 4096u
 #define POSE_MEMORY_LIMIT (16u * 1024u * 1024u)
+#define SNAPSHOT_BUDGET (32u * 1024u * 1024u)
+#define PLAYER_LIMIT 128u
 
 typedef struct {
   void *object, *destination;
@@ -36,6 +38,7 @@ typedef struct PosePlayer {
   unsigned commands, motions, buffers, previous_commands;
   unsigned command_capacity, motion_capacity, buffer_capacity, previous_capacity;
   int valid;
+  uint64_t last_used;
   float phase;
   PoseCommand *command, *previous;
   PoseMotion *motion;
@@ -56,35 +59,62 @@ static const void *(*g_motion_type)(void *, int);
 static uintptr_t g_game_base;
 static unsigned long g_resampled;
 static int g_installed, g_drawing, g_evaluation_depth;
+static uint64_t g_generation;
+static unsigned g_player_count;
+static size_t g_snapshot_bytes;
+
+static void release_player(PosePlayer *entry) {
+  for (unsigned index = 0; index < entry->buffer_capacity; index++) {
+    g_snapshot_bytes -= entry->buffer[index].capacity * 2;
+    free(entry->buffer[index].initial_data);
+    free(entry->buffer[index].restore_data);
+  }
+  free(entry->buffer);
+  free(entry->command);
+  free(entry->previous);
+  free(entry->motion);
+  free(entry);
+  g_player_count--;
+}
+
+void jsr_pose60_tick(void) {
+  g_generation++;
+  for (PosePlayer **link = &g_players; *link;) {
+    PosePlayer *entry = *link;
+    if (entry != g_capture && entry->last_used + 2 < g_generation) {
+      *link = entry->next;
+      release_player(entry);
+    } else {
+      link = &entry->next;
+    }
+  }
+}
 
 void jsr_pose60_reset(void) {
   while (g_players) {
     PosePlayer *entry = g_players;
     g_players = entry->next;
-    for (unsigned index = 0; index < entry->buffer_capacity; index++) {
-      free(entry->buffer[index].initial_data);
-      free(entry->buffer[index].restore_data);
-    }
-    free(entry->buffer);
-    free(entry->command);
-    free(entry->previous);
-    free(entry->motion);
-    free(entry);
+    release_player(entry);
   }
   g_capture = NULL;
   g_resampled = 0;
   g_drawing = g_evaluation_depth = 0;
+  g_generation = 0;
 }
 
 static PosePlayer *find_player(void *player, int create) {
   for (PosePlayer *entry = g_players; entry; entry = entry->next)
-    if (entry->player == player)
+    if (entry->player == player) {
+      entry->last_used = g_generation;
       return entry;
-  if (!create)
+    }
+  if (!create || g_player_count >= PLAYER_LIMIT)
     return NULL;
   PosePlayer *entry = calloc(1, sizeof *entry);
   if (entry) {
     entry->player = player;
+    entry->last_used = g_generation;
+    g_player_count++;
     entry->next = g_players;
     g_players = entry;
   }
@@ -130,14 +160,28 @@ void jsr_pose60_begin(void *player) {
 void jsr_pose60_end(void) { g_capture = NULL; }
 
 void jsr_pose60_forget(void *player) {
-  PosePlayer *entry = find_player(player, 0);
-  if (entry)
-    entry->valid = 0;
+  for (PosePlayer **link = &g_players; *link; link = &(*link)->next) {
+    PosePlayer *entry = *link;
+    if (entry->player == player) {
+      if (entry == g_capture || g_drawing) {
+        entry->valid = 0;
+      } else {
+        *link = entry->next;
+        release_player(entry);
+      }
+      return;
+    }
+  }
 }
 
 void jsr_pose60_phase(void *player, float phase) {
   PosePlayer *entry = find_player(player, 0);
   if (entry)
+    entry->phase = isfinite(phase) && phase > 0.0f && phase < 1.0f ? phase : 0.0f;
+}
+
+void jsr_pose60_present(float phase) {
+  for (PosePlayer *entry = g_players; entry; entry = entry->next)
     entry->phase = isfinite(phase) && phase > 0.0f && phase < 1.0f ? phase : 0.0f;
 }
 
@@ -193,6 +237,9 @@ static int snapshot(PosePlayer *entry, const PoseCommand *command) {
     return 0;
   PoseBuffer *buffer = &entry->buffer[entry->buffers];
   if (buffer->capacity < size) {
+    size_t extra = (size - buffer->capacity) * 2;
+    if (extra > SNAPSHOT_BUDGET - g_snapshot_bytes)
+      return 0;
     uint8_t *initial = malloc(size), *restore = malloc(size);
     if (!initial || !restore) {
       free(initial);
@@ -204,6 +251,7 @@ static int snapshot(PosePlayer *entry, const PoseCommand *command) {
     buffer->initial_data = initial;
     buffer->restore_data = restore;
     buffer->capacity = size;
+    g_snapshot_bytes += extra;
   }
   buffer->header = command->destination;
   buffer->data = data;

@@ -99,7 +99,7 @@ static const CfgOpt k_opts[] = {
 
     ROW_R("controls", "moga", "true",
           "# Native MOGA-style input. Left stick moves; right stick controls the camera.\n"
-          "# A jumps, B backs out, L/ZL sprays, R/ZR dashes, + pauses.\n"
+          "# A jumps, B backs out, ZL sprays, L centers the camera, R/ZR dashes, + pauses.\n"
           "# With false, use the legacy touch-coordinate button layout.", CFG_BOOL, NULL),
     ROW("controls", "layout_height", "720",
         "# The height of the touch layout the button points below are written\n"

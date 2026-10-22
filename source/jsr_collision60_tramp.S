@@ -36,5 +36,53 @@ jsr_coli60_original_object:
     sub sp, sp, #16
     tail jsr_coli60_object_tail
 .size jsr_coli60_original_object, .-jsr_coli60_original_object
+.macro graffiti name, saved:vararg
+.global jsr_coli60_original_graffiti_\name
+.type jsr_coli60_original_graffiti_\name, %function
+.thumb_func
+jsr_coli60_original_graffiti_\name:
+    push {\saved}
+    cbz r0, .Lreturn_\name
+    cbz r1, .Lskip_\name
+    movs r3, #0
+    tail jsr_coli60_graffiti_\name\()_tail
+.Lskip_\name:
+    ldr ip, =jsr_coli60_graffiti_\name\()_tail
+    ldr ip, [ip]
+    add ip, ip, #2
+    bx ip
+.Lreturn_\name:
+    pop {\saved}
+    bx lr
+.size jsr_coli60_original_graffiti_\name, .-jsr_coli60_original_graffiti_\name
+.endm
+graffiti pos, r4-r7
+graffiti ignore, r4-r7
+graffiti range, r4-r6
+.global jsr_coli60_original_graffiti_enemy_range
+.type jsr_coli60_original_graffiti_enemy_range, %function
+.thumb_func
+jsr_coli60_original_graffiti_enemy_range:
+    push {r4-r7}
+    cbz r2, .Lenemy_range_skip
+    mov r3, #-1
+    tail jsr_coli60_graffiti_enemy_range_tail
+.Lenemy_range_skip:
+    ldr ip, =jsr_coli60_graffiti_enemy_range_tail
+    ldr ip, [ip]
+    add ip, ip, #2
+    bx ip
+.size jsr_coli60_original_graffiti_enemy_range, .-jsr_coli60_original_graffiti_enemy_range
+.global jsr_coli60_original_follow
+.type jsr_coli60_original_follow, %function
+.thumb_func
+jsr_coli60_original_follow:
+    push {r4-r6}
+    cbz r1, .Lfollow_tail
+    movs r3, #0
+    str r3, [r1]
+.Lfollow_tail:
+    tail jsr_coli60_follow_tail
+.size jsr_coli60_original_follow, .-jsr_coli60_original_follow
 .ltorg
 .section .note.GNU-stack,"",%progbits

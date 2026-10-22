@@ -51,11 +51,13 @@ int jsr_audio_start(void);
 void jsr_audio_bind(so_module *module);
 void jsr_audio_stop(void);
 void jsr_audio_pause(int paused);
+void jsr_audio_catchup(int active);
 
 /* ------------------------------------------------------------ jsr_input.c */
 /* Called once per frame, before step(): the touch screen as the touches the
  * engine asked for, and the buttons as their layout points. */
 void jsr_input_init(void);
+int jsr_input_install(so_module *module);
 void jsr_input_poll(void);
 int jsr_input_pad_connected(void);
 /* One press at a point, as its own batch (the frame loop's KEY_PLUS). */

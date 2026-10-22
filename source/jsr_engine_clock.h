@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 typedef struct {
-  uint64_t last_ns, remainder, elapsed_units;
+  uint64_t last_ns, remainder, elapsed_units, pending_ns;
   float scale;
   unsigned counter_steps;
   int started;

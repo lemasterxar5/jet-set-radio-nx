@@ -19,6 +19,7 @@ static int16_t g_previous[2], g_next[2];
 static uint32_t g_phase, g_rate;
 static int g_seeded, g_pump;
 static volatile int g_running, g_paused;
+static volatile int g_catchup;
 static unsigned long g_blocks, g_invalid, g_active_mask;
 static int g_peak, g_reported_sound;
 static Mutex g_lock;
@@ -74,7 +75,7 @@ static void source_frame(int16_t frame[2]) {
 static void pump(int16_t *out, int frames, void *ud) {
   (void)ud;
   memset(out, 0, (size_t)frames * 2 * sizeof *out);
-  if (!g_running || g_paused || !g_array || !g_nat.audioFillStreamBuffer)
+  if (!g_running || g_paused || g_catchup || !g_array || !g_nat.audioFillStreamBuffer)
     return;
   if (!g_seeded) {
     source_frame(g_previous);
@@ -140,6 +141,7 @@ int jsr_audio_start(void) {
   g_blocks = g_invalid = g_active_mask = 0;
   g_peak = g_reported_sound = 0;
   g_paused = 0;
+  g_catchup = 0;
   mutexInit(&g_lock);
   rt_audout_cancel(0);
   rt_audout_pause(0);
@@ -159,7 +161,12 @@ int jsr_audio_start(void) {
 
 void jsr_audio_pause(int paused) {
   g_paused = paused;
-  rt_audout_pause(paused);
+  rt_audout_pause(g_paused || g_catchup);
+}
+
+void jsr_audio_catchup(int active) {
+  g_catchup = active;
+  rt_audout_pause(g_paused || g_catchup);
 }
 
 void jsr_audio_stop(void) {

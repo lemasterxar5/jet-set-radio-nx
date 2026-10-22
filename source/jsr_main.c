@@ -119,6 +119,8 @@ int port_load(const char *apk) {
   if (left)
     debugPrintf("[boot] WARNING: %d import(s) of %s unresolved\n", left, lib);
   so_fix_kuser_helpers(&g_mod);
+  if (!jsr_input_install(&g_mod))
+    fatal_error("The game library does not match the supported controller profile.");
   jsr_timing_install(&g_mod);
   if (!jsr_visuals_install(&g_mod))
     debugPrintf("[visuals] distance profile not applied; original visibility retained\n");
