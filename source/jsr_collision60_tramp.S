@@ -84,5 +84,47 @@ jsr_coli60_original_follow:
 .Lfollow_tail:
     tail jsr_coli60_follow_tail
 .size jsr_coli60_original_follow, .-jsr_coli60_original_follow
+.macro static_registration name
+.global jsr_coli60_original_\name
+.type jsr_coli60_original_\name, %function
+.thumb_func
+jsr_coli60_original_\name:
+    push {r4-r7, lr}
+    mov r4, r0
+    sub sp, sp, #12
+    cbz r1, .Lstatic_skip_\name
+    tail jsr_coli60_\name\()_tail
+.Lstatic_skip_\name:
+    ldr ip, =jsr_coli60_\name\()_tail
+    ldr ip, [ip]
+    add ip, ip, #4
+    bx ip
+.size jsr_coli60_original_\name, .-jsr_coli60_original_\name
+.endm
+static_registration static_object
+static_registration ground
+.global jsr_coli60_original_simple_move
+.type jsr_coli60_original_simple_move, %function
+.thumb_func
+jsr_coli60_original_simple_move:
+    push {r4-r8, lr}
+    mov r6, r2
+    mov r4, r0
+    tail jsr_coli60_simple_move_tail
+.size jsr_coli60_original_simple_move, .-jsr_coli60_original_simple_move
+.global jsr_coli60_original_enemy_pos
+.type jsr_coli60_original_enemy_pos, %function
+.thumb_func
+jsr_coli60_original_enemy_pos:
+    push {r4-r6}
+    cbz r0, .Lenemy_pos_return
+    ldr r3, =jsr_coli60_enemy_pos_literal
+    ldr r3, [r3]
+    mov r1, r0
+    tail jsr_coli60_enemy_pos_tail
+.Lenemy_pos_return:
+    pop {r4-r6}
+    bx lr
+.size jsr_coli60_original_enemy_pos, .-jsr_coli60_original_enemy_pos
 .ltorg
 .section .note.GNU-stack,"",%progbits

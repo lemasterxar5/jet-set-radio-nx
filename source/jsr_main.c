@@ -35,7 +35,7 @@
 #include "jsr_memory.h"
 #include "jsr_render_safety.h"
 #include "jsr_visuals.h"
-#include "jsr_fps.h"
+#include "jsr_saltynx.h"
 #include "rt_applet.h"
 #include "rt_audout.h"
 #include "rt_boot.h"
@@ -180,7 +180,6 @@ void port_focus_lost(void) {
 
 void port_focus_gained(void) {
   jsr_timing_reset();
-  jsr_fps_reset();
   if (!g_running)
     return;
   if (g_nat.onResume)
@@ -255,6 +254,7 @@ static void gl_note(const char *what) {
   } while (0)
 
 void port_run(void) {
+  jsr_saltynx_init();
   so_execute_init_array(&g_mod); /* System.loadLibrary: the constructors ... */
   jni_init();
   jsr_java_patch_monitors();     /* ... then the monitors lock for real */
@@ -375,6 +375,7 @@ void port_run(void) {
   }
   rt_applet_stop();
   g_running = 0;
+  jsr_saltynx_exit();
   jsr_audio_stop();
   if (log_quiet)
     log_set_quiet(0); /* write out what the ring holds */

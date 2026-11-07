@@ -14,13 +14,14 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <switch.h>
+#include <string.h>
 
 #include "gl_layer.h"
 #include "rt_cfg.h"
 #include "rt_settings.h"
 #include "rt_window.h"
 #include "jsr.h"
-#include "jsr_fps.h"
+#include "jsr_saltynx.h"
 #ifdef JSR_TARGET_PROBE
 #include "jsr_target.h"
 #endif
@@ -50,7 +51,21 @@ static EGLConfig g_cfg;
 static EGLSurface g_surf = EGL_NO_SURFACE;
 static EGLContext g_ctx;
 static int g_ready;
-static int g_fps_overlay;
+static void (*g_real_viewport)(GLint, GLint, GLsizei, GLsizei);
+
+static void measured_viewport(GLint left, GLint top, GLsizei width, GLsizei height) {
+  g_real_viewport(left, top, width, height);
+  if (width > 0 && height > 0)
+    jsr_saltynx_record_viewport((unsigned)width, (unsigned)height);
+}
+
+void *port_import_interpose(const char *symbol, void *real) {
+  if (real && !strcmp(symbol, "glViewport")) {
+    g_real_viewport = real;
+    return measured_viewport;
+  }
+  return real;
+}
 
 /* Display, config, surface and the main context; g_lock held.
  *
@@ -85,7 +100,6 @@ static int make_main(void) {
    * ([display] frame_rate; 30 runs cooler in handheld). */
   b_eglSwapInterval(g_dpy, rt_config_int("display", "frame_rate") == 1 ? 2 : 1);
   g_ready = 1;
-  g_fps_overlay = rt_config_value("display.fps_overlay", 0);
   EGLint actual_depth = 0, actual_stencil = 0;
   eglGetConfigAttrib(g_dpy, g_cfg, EGL_DEPTH_SIZE, &actual_depth);
   eglGetConfigAttrib(g_dpy, g_cfg, EGL_STENCIL_SIZE, &actual_stencil);
@@ -120,13 +134,11 @@ void jsr_egl_swap(void) {
 #ifdef JSR_TARGET_PROBE
     jsr_target_present();
 #endif
-    if (g_fps_overlay) {
+    if (b_eglSwapBuffers(g_dpy, g_surf)) {
       EGLint width = 0, height = 0;
       b_eglQuerySurface(g_dpy, g_surf, EGL_WIDTH, &width);
       b_eglQuerySurface(g_dpy, g_surf, EGL_HEIGHT, &height);
-      jsr_fps_draw(width, height);
+      jsr_saltynx_present(width > 0 ? (unsigned)width : 0, height > 0 ? (unsigned)height : 0);
     }
-    if (b_eglSwapBuffers(g_dpy, g_surf) && g_fps_overlay)
-      jsr_fps_presented(armTicksToNs(armGetSystemTick()));
   }
 }

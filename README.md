@@ -8,7 +8,7 @@ An unofficial homebrew wrapper for the Android ARMv7 version of Jet Set Radio on
 
 According to the author's console testing, the game runs at **60 FPS at stock clocks**, and can even maintain 60 FPS in tested scenes at **607 MHz CPU / 151 MHz GPU**. These are author-reported measurements, not a guarantee for every area, SD card or configuration. Loading and demanding scenes may cause dips.
 
-The `native60` mode is enabled by default. It adapts engine timing and evaluates character poses at the presentation rate, without matrix interpolation or generated intermediate frames. Recorded commands and some tutorial clocks remain at 30 Hz to preserve synchronization. This does not mean that every original engine subsystem has been converted to 60 Hz. Default object draw distance is **×2.5**, with detail distance at **×1.5**.
+The `native60` mode is enabled by default. It adapts engine timing and player poses to the presentation rate, without matrix interpolation or generated intermediate frames. Live enemy logic and its poses retain their original 30 Hz cadence; recorded commands and some tutorial clocks also remain at 30 Hz to preserve synchronization. Player physics and input retain their 60 Hz adaptations. This does not mean that every original engine subsystem has been converted to 60 Hz. Default object draw distance is **×2.5**, with detail distance at **×2**.
 
 **Clock measurement note:** by default, the port requests a temporary CPU boost while loading and a handheld GPU boost to 460.8 MHz. To test strictly at stock clocks or 607/151 without these requests, disable both in `/switch/jsr_nx/config.ini`:
 
@@ -20,25 +20,13 @@ gpu_boost_handheld=false
 
 The port does not set 607/151 MHz automatically. Those clocks must be configured externally.
 
-## FPS counter — disabled by default
+## FPS and resolution — SaltyNX
 
-The on-screen FPS counter is still included, but **is disabled by default**. To enable it manually:
+The built-in graphical FPS counter has been removed. The port publishes presentation timing and observed GLES viewport sizes to SaltyNX shared memory for compatible overlays, such as Status Monitor Overlay. Install and enable SaltyNX and the overlay separately; neither is bundled. The game still runs if SaltyNX is absent.
 
-1. Launch the game once to generate `/switch/jsr_nx/config.ini`, then close it completely.
-2. Open that file and change `fps_overlay` in the existing `[display]` section:
+Old `fps_overlay` settings are ignored; you do not need to delete your configuration or saves. The `show_fps` option remains a separate diagnostic log setting, not an on-screen counter.
 
-   ```ini
-   [display]
-   fps_overlay=true
-   ```
-
-3. Save the file and restart the game. The counter appears in the top-left corner and updates twice per second.
-
-Set `fps_overlay=false` and restart to hide it again. If `[display]` already exists, edit its existing setting rather than adding a duplicate section or key. There is no controller shortcut or in-game toggle for this option.
-
-**Upgrading from an earlier build:** existing settings are preserved. If your current file already contains `fps_overlay=true`, the counter stays enabled until you change it to `false`. The new default applies to fresh configurations and missing settings; it does not overwrite an explicit user choice. You do not need to delete your config or saves.
-
-The counter measures presented frames, not the frequency of every simulation subsystem. `show_fps` is a separate debug-log option, not the on-screen overlay, and is also disabled by default. Hiding the overlay does not disable native 60 FPS gameplay.
+FPS counts successful EGL presentations, not simulation updates. Reported viewport sizes are observed rendering dimensions, not a guaranteed identification of the internal 3D resolution: UI, off-screen and post-processing passes may use different sizes. No synthetic depth-buffer measurements are advertised. See [docs/SALTYNX.md](docs/SALTYNX.md) for implementation details and console-validation limits.
 
 ## Requirements and installation
 
@@ -73,7 +61,8 @@ Default native MOGA-style layout:
 | D-pad | Menu navigation |
 | A | Jump / Confirm |
 | B | Back / Cancel |
-| L / ZL | Graffiti / Spray |
+| ZL | Graffiti / Spray |
+| L | Center camera |
 | R / ZR | Dash |
 | + | Pause |
 | − | Android / system Back |
@@ -100,11 +89,12 @@ sh launcher/build.sh
 
 Output: `launcher/jsr_nx.nro`. Building the wrapper does not require an APK. `tools/elf32_nso.py` uses LZ4 if installed in the build environment's Python; otherwise it produces an uncompressed NSO. The LZ4 package is not bundled. The root build script rejects a missing Mesa installation to avoid accidentally building a null renderer.
 
-Toolchain images are not pinned to a digest. The clean source export has not been rebuilt end-to-end with Docker; packaging checks do not replace that test. The release payload was rebuilt using the existing local devkit toolchain and dependencies.
+Toolchain images are not pinned to a digest. This candidate is built with Docker, the supplied libnx32 and Mesa32 20.1 sources, and devkitA64 for its launcher. The runtime includes the missing device, logging and watchdog sources restored from the supplied android32 tree.
 
 ## Status and limitations
 
-- Release 1.0.0 includes the rebuilt payload with the FPS overlay disabled by default. The public release version and internal timestamp build number are separate identifiers.
+- This candidate replaces the internal graphical FPS counter with optional SaltyNX telemetry. The public release version and internal timestamp build number are separate identifiers.
+- Live NPC controllers use their original 30 Hz logic cadence, including police pursuit timers, while player physics/input and presentation retain their 60 Hz adaptations. NPC poses can retain their original 30 Hz cadence. See [NPC timing](docs/NPC-TIMING.md) for coverage and console checks.
 - It retains the empty shadow-batch fix for the crash observed in the second tutorial. Targeted tests cover the fix, but a complete console tutorial retest is still needed.
 - Native 60 FPS includes experimental engine adaptations; flawless behavior across every tutorial, transition and physics interaction is not guaranteed.
 - Android's `playVideo` call is not implemented; cinematic playback is not guaranteed.
@@ -127,6 +117,8 @@ Thank you to everyone developing and maintaining the libraries and tools that ma
 - **Jean-loup Gailly, Mark Adler and [zlib](https://zlib.net/) contributors**, and the **[Expat](https://github.com/libexpat/libexpat)** and **[BLAKE3](https://github.com/BLAKE3-team/BLAKE3)** teams, for dependencies used by Mesa variants supported in the environment.
 - **The GCC, newlib, binutils, Python and Docker teams**, and **the LZ4 authors**, for the build and packaging tools.
 - **The FFmpeg authors**, for their work and dependencies supplied during development. FFmpeg is not linked into this release and does not imply current video support.
+- **masagrator and the SaltyNX / Status Monitor Overlay contributors**, for their public telemetry protocol and overlay tools.
+- **NaGaa95**, for the [NetherSX2 SaltyNX integration](https://github.com/NaGaa95/NetherSX2_nx/blob/main/source/saltynx.cpp) used as a reference for early session handling and independent telemetry publication.
 - **SEGA and the original creators of Jet Set Radio**, for the game. Their commercial code and assets are not redistributed here.
 
 ### Special thanks

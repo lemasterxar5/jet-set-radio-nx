@@ -10,6 +10,7 @@
 #include "jsr_engine_fall.h"
 #include "jsr_event60.h"
 #include "jsr_native60.h"
+#include "jsr_npc30.h"
 #include "jsr_pose60.h"
 #include "rt_applet.h"
 #include "rt_cfg.h"
@@ -590,6 +591,11 @@ void jsr_n60_dispatch(void *object, void (*callback)(void *)) {
   }
   if (address != g_player_callback && address != g_camera_callback) {
     int previous = g_scaled;
+    g_scaled = 0;
+    if (jsr_npc30_dispatch(object, callback, legacy_steps())) {
+      g_scaled = previous;
+      return;
+    }
     g_scaled = 1;
     if (!jsr_event60_dispatch(object, callback, g_clock.scale, legacy_steps()))
       callback(object);
@@ -892,11 +898,14 @@ int jsr_native60_install(so_module *module) {
     return 0;
   if (!jsr_event60_validate(module))
     return 0;
+  if (!jsr_npc30_validate(module))
+    return 0;
   if (!jsr_collision60_install(module)) {
     debugPrintf("[native60] unsupported collision registration profile; original timing retained\n");
     return 0;
   }
   jsr_event60_install(module);
+  jsr_npc30_install(module);
   g_game_base = base;
   g_action_get = (void *)(base + 0x1af659);
   g_player_callback = base + 0x1d71c8 + 1;

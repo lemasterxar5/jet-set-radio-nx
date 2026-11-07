@@ -400,8 +400,10 @@ static uintptr_t so_resolve_symbol(so_module *mod, const DynLibFunction *funcs, 
     if (a)
       return (uintptr_t)port_import_interpose(name, (void *)a);
   }
-  if (name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z')
-    return dcr_gl_lookup(name);
+  if (name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z') {
+    uintptr_t address = dcr_gl_lookup(name);
+    return address ? (uintptr_t)port_import_interpose(name, (void *)address) : 0;
+  }
   return 0;
 }
 

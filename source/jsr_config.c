@@ -56,7 +56,7 @@ static const CfgOpt k_opts[] = {
     ROW_R("display", "draw_distance", "2.5",
           "# Object visibility multiplier (1 = original). Higher values can reduce FPS.",
           CFG_FLOAT, NULL, NULL, 1.0f, 2.5f),
-    ROW_R("display", "detail_distance", "1.5",
+    ROW_R("display", "detail_distance", "2.0",
           "# Keep detailed object models/textures farther away (1 = original).",
           CFG_FLOAT, NULL, NULL, 1.0f, 2.0f),
     ROW("display", "resolution", "auto",
@@ -75,9 +75,6 @@ static const CfgOpt k_opts[] = {
           "# Live input per frame; recorded commands/actors/cameras and stage clock at 30 Hz.\n"
           "# Not a fully converted 60 Hz engine; physics and transitions need testing.", CFG_BOOL, NULL),
     ROW("display", "show_fps", "false", "# An [fps] line every two seconds.", F(show_fps)),
-    ROW_R("display", "fps_overlay", "false",
-          "# Rendered frames per second in the top-left corner; updated twice a second.\n"
-          "# Counts presentation, not the original 30 Hz gameplay simulation.", CFG_BOOL, NULL),
     ROW("display", "crosshair", "true", "# A small crosshair in the middle of the screen.", F(crosshair)),
     ROW_R("display", "decode_etc1", "false",
           "# CPU-decode ETC1 textures to RGB8 for emulators with broken ETC support.\n"
@@ -167,9 +164,10 @@ static const CfgTable k_table = {
     .nopts = CFG_COUNT(k_opts),
     .sections = k_sections,
     .nsections = CFG_COUNT(k_sections),
-    .migrate = (const CfgMigrate[]){{"display", "draw_distance", "1.5", "2.5", 2}},
-    .nmigrate = 1,
-    .version = 2,
+    .migrate = (const CfgMigrate[]){{"display", "draw_distance", "1.5", "2.5", 2},
+                                  {"display", "detail_distance", "1.5", "2.0", 3}},
+    .nmigrate = 2,
+    .version = 3,
     .apply = apply,
 };
 
